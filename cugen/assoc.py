@@ -78,10 +78,19 @@ def _distribute_chromosomes(variant_counts: dict, n_workers: int):
 
 
 def _compute_lambda_gc(p_values: np.ndarray) -> float:
-    """Genomic inflation factor (lambda GC)."""
+    """Genomic inflation factor (lambda GC).
+
+    Uses the survival-function inverse ``chi2.isf(p)`` rather than
+    ``chi2.ppf(1 - p)``: the latter forms ``1 - p`` which loses all precision
+    for genome-wide-significant p (1 - 1e-50 == 1.0 in float64), pushing chi2
+    to +inf and corrupting the median. isf evaluates the upper tail directly.
+    """
     from scipy import stats as sp_stats
-    chi2 = sp_stats.chi2.ppf(1 - p_values, df=1)
-    chi2 = chi2[~np.isnan(chi2) & ~np.isinf(chi2)]
+    p = np.asarray(p_values, dtype=np.float64)
+    p = p[np.isfinite(p)]
+    p = np.clip(p, 1e-300, 1.0)
+    chi2 = sp_stats.chi2.isf(p, df=1)
+    chi2 = chi2[np.isfinite(chi2)]
     if len(chi2) == 0:
         return float('nan')
     return float(np.median(chi2) / 0.4549364)

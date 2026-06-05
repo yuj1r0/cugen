@@ -188,8 +188,17 @@ def spa_pvalues_centered_gpu(
     v = t * cp.sqrt(cp.maximum(Kpp, EPS64))
     safe_w = cp.where(cp.abs(w) > 1e-12, w, 1.0)  # |w|<1e-12 masked by `valid`
     r = w + cp.log(cp.maximum(cp.abs(v / safe_w), EPS64)) / safe_w
-    cdf_r = 0.5 * (1.0 + _gpu_erf(r / SQRT2))
-    p_one = cp.where(U >= 0.0, 1.0 - cdf_r, cdf_r)
+    # Tail via erfc survival function — NO `1 - cdf` cancellation. The old form
+    # `p_one = 1 - 0.5*(1+erf(r/sqrt2))` floors the saddlepoint tail at float64
+    # eps (~1e-16): strong real signals capped at -log10P=16 while only
+    # root-find failures fell back to erfc and reached 1e-300, producing a
+    # bimodal Manhattan (wall at 16, clump at 300, empty between). erfc computes
+    # the tail directly and stays accurate to ~1e-300, restoring the continuous
+    # locus "tower". Upper tail (U>=0): 1-Phi(r)=0.5*erfc(r/sqrt2);
+    # lower tail (U<0): Phi(r)=0.5*erfc(-r/sqrt2).
+    p_one = cp.where(U >= 0.0,
+                     0.5 * _gpu_erfc(r / SQRT2),
+                     0.5 * _gpu_erfc(-r / SQRT2))
     p_two = 2.0 * cp.minimum(p_one, 1.0 - p_one)
     p_two = cp.clip(p_two, 1e-300, 1.0)
 
