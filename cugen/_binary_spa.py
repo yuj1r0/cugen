@@ -43,6 +43,39 @@ def sigmoid_gpu(x: cp.ndarray) -> cp.ndarray:
     return 0.5 * (cp.tanh(x * 0.5) + 1.0)
 
 
+def recalibrate_eta_gpu(y_gpu, eta_gpu, max_iter: int = 50, tol: float = 1e-10):
+    """Per-chromosome logistic recalibration of an offset onto the logit scale.
+
+    Fits the 2-parameter logistic null  logit(mu_i) = a + b * eta_i  by Newton's
+    method (closed-form 2x2 Hessian inverse) and returns the recalibrated linear
+    predictor eta' = a + b*eta. This puts an LPM-derived LOCO offset on the proper
+    probability scale before the score/SPA test — important for low-prevalence,
+    ascertainment-shaped binary traits (gpt-5.5 Rec 4). All in float64.
+
+    Returns (eta_recal_f32, a, b).
+    """
+    y = y_gpu.astype(cp.float64)
+    e = eta_gpu.astype(cp.float64)
+    a = 0.0
+    b = 1.0
+    for _ in range(max_iter):
+        lin = a + b * e
+        mu = 0.5 * (cp.tanh(lin * 0.5) + 1.0)
+        w = cp.maximum(mu * (1.0 - mu), 1e-12)
+        rr = y - mu
+        g0 = float(cp.sum(rr)); g1 = float(cp.sum(e * rr))
+        h00 = float(cp.sum(w)); h01 = float(cp.sum(w * e)); h11 = float(cp.sum(w * e * e))
+        det = h00 * h11 - h01 * h01
+        if abs(det) < 1e-300:
+            break
+        da = (h11 * g0 - h01 * g1) / det
+        db = (-h01 * g0 + h00 * g1) / det
+        a += da; b += db
+        if max(abs(da), abs(db)) < tol:
+            break
+    return (a + b * e).astype(cp.float32), a, b
+
+
 def _batched_Xv(X_gpu: cp.ndarray, v_gpu: cp.ndarray, batch_size: int = 4096) -> cp.ndarray:
     """Compute X @ v in column batches to avoid CuPy float64 upcasting OOM."""
     n = X_gpu.shape[0]

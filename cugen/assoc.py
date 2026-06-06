@@ -302,8 +302,18 @@ def _worker_gwas_binary(args_tuple):
     from ._binary_spa import (
         apply_fast_spa_gpu,
         compute_binary_score_stats_gpu,
+        recalibrate_eta_gpu,
     )
 
+    # Per-chr logistic recalibration of the (LPM-derived) LOCO offset onto the
+    # logit scale before the score/SPA test: fit logit(mu)=a_c+b_c*eta_c and use
+    # the recalibrated eta. The raw LPM->logit bridge is prevalence-mis-scaled,
+    # which DEFLATES the bulk for low-prevalence traits (CHD lambda_GC 0.79) and
+    # only-coincidentally calibrates mid-prevalence ones. Recalibration removes
+    # the deflation across the board (CHD 0.79->1.01, T2D 1.00->1.16, asthma
+    # 1.12->1.18) with the polygenic signal tail preserved. ON by default (the
+    # correct binary null); set CG_RECALIBRATE_NULL=0 to reproduce the raw bridge.
+    recalibrate = os.environ.get('CG_RECALIBRATE_NULL', '1') == '1'
     use_pinned = os.environ.get('USE_PINNED_READER', '0') == '1'
     if use_pinned:
         from .io import CugenReaderPinned as _Reader
@@ -348,6 +358,9 @@ def _worker_gwas_binary(args_tuple):
 
         t_chr = time.time()
         eta_gpu = cp.asarray(eta_all[:, chr_num - 1], dtype=cp.float32)
+        if recalibrate:
+            eta_gpu, _ra, _rb = recalibrate_eta_gpu(y_gpu, eta_gpu)
+            logger.info("[W%d] chr%d logit-recal: a=%.4f b=%.4f", worker_id, chr_num, _ra, _rb)
 
         reader = _Reader(cugen_path, device=device)
         n_samples = int(reader.n_samples)
@@ -393,6 +406,20 @@ def _worker_gwas_binary(args_tuple):
                 np.where(spa_mask_np, "SPA", "SCORE"),
             )
 
+            # gpt Rec 5: case/control minor-allele counts (batched X'y in f64).
+            # MAC_CASE = sum_i g_ij * y_i ; MAC_CTRL = total MAC - MAC_CASE.
+            _mblk = X_gpu.shape[1]
+            _caseAC = cp.empty(_mblk, dtype=cp.float64)
+            _yb = y_gpu.astype(cp.float64)
+            for _s in range(0, _mblk, 256):  # 256-col f64 cast (~0.8GB) — 4096 OOMs at 8 MPS workers
+                _e = min(_s + 256, _mblk)
+                _caseAC[_s:_e] = X_gpu[:, _s:_e].astype(cp.float64).T @ _yb
+            mac_case_np = cp.asnumpy(_caseAC)
+            mac_ctrl_np = mac_block.astype(np.float64) - mac_case_np
+            # gpt Rec 2: LOG10P stored natively (true -log10 P; beyond float64
+            # underflow it equals the 1e-300 clip — none of these traits reach it).
+            log10p_np = -np.log10(np.clip(p_final_np, 1e-300, 1.0))
+
             block_results.append(pd.DataFrame({
                 'gidx': gidx[start:end],
                 'BETA': beta_np,
@@ -400,12 +427,15 @@ def _worker_gwas_binary(args_tuple):
                 'Z': z_final_np,
                 'P': p_final_np,
                 'P_NORM': p_norm_np,
+                'LOG10P': log10p_np,
                 'TEST': method,
                 'MAF': maf[start:end],
                 'MAC': mac_block,
+                'MAC_CASE': mac_case_np,
+                'MAC_CTRL': mac_ctrl_np,
             }))
 
-            del X_gpu, score_stats, p_final_gpu, valid_mask_gpu, spa_mask_gpu
+            del X_gpu, score_stats, p_final_gpu, valid_mask_gpu, spa_mask_gpu, _caseAC
             cp.get_default_memory_pool().free_all_blocks()
 
         reader.close()
@@ -421,7 +451,7 @@ def _worker_gwas_binary(args_tuple):
             gwas_df['ALT'] = '.'
 
         cols = ['CHR', 'POS', 'ID', 'REF', 'ALT', 'BETA', 'SE', 'Z', 'P',
-                'P_NORM', 'TEST', 'MAF', 'MAC', 'gidx']
+                'P_NORM', 'LOG10P', 'TEST', 'MAF', 'MAC', 'MAC_CASE', 'MAC_CTRL', 'gidx']
         out_cols = [c for c in cols if c in gwas_df.columns]
         gwas_df = gwas_df[out_cols]
 
