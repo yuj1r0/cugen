@@ -8,15 +8,15 @@
 
 ## What CuGen is
 
-CuGen is a GPU-native framework designed from the ground up for
-comprehensive biobank-scale genomics. Its architecture centers around
-three core innovations:
+CuGen is the world's first fully GPU-native framework designed for biobank-scale genomics. Its GPU-acceleration architecture centers around three core innovations:
 
-1. **`ultraLasso`** — a sparse hierarchical regression framework built
+1. **`ultraLasso`** — a memory and computationally efficient sparse 
+   hierarchical regression framework built
    upon uniLasso, producing compact phenotype-informed predictors
    optimized for confounding control through leave-one-chromosome-out
    (LOCO) predictions. The same active set powers both downstream GWAS
-   and fine-mapping in a single pipeline.
+   and fine-mapping (UltraSuSie) in a single pipeline as embarrassingly
+   parallelizable operations. 
 
 2. **The `.cugen` file format** — *Compute Unified Genomes*. A
    CUDA-optimized 2-bit-packed variant-major genotype container with
@@ -25,19 +25,18 @@ three core innovations:
    annotations and imputed datasets. The same file supports both
    *streaming* mode (pinned host + async H2D for ultraLasso's sequential
    scans) and *random-access* mode (direct `pread` for UltraSuSiE's
-   per-locus sufficient statistics).
+   per-locus sufficient statistics). Fine-mapping leverages in-sample 
+   LD via `.cugen` random-access, avoiding external reference-panel mismatches.
 
 3. **An integrated GPU-native toolkit** for routine genomic analyses,
    including QC, allele-frequency computation, polygenic scoring, and
    visualization — simplifying workflows by removing unnecessary file
-   conversions and software juggling.
+   conversions and software juggling. In beta version the toolkit is not
+   yet complete, but the goal is to perform all operations eventually on GPUs. 
 
-`UltraSuSiE` (Tier 1) and `UltraMAP` (Tier 2), the in-sample SuSiE-RSS
-and adaptive-LASSO consensus fine-mappers, are step 5 of the same
-ultraLasso pipeline. Fine-mapping leverages in-sample LD via `.cugen`
-random-access, avoiding external reference-panel mismatches.
+Using CuGen starts by converting your genomes to `.cugen` file format. 
 
-## How it works
+Together these enable a full GWAS-pipeline, including fine-mapping, to be run in UKBB in as less as 10 minutes. 
 
 The full ultraLasso pipeline lives under the `cg.ultralasso.*`
 namespace. Each stage maps to one function call:
