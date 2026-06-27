@@ -21,6 +21,15 @@ scikit-learn-style namespace::
     # Or end-to-end:
     result = ultralasso.run(cohort_npz=..., cugen_dir=...)
 
+    # Polygenic score (PRS): build train/val/test splits + subset cugens, then
+    # sweep step-3 alpha on validation, refit the best on train+val, score test:
+    ultralasso.build_prs_splits(ref_npz=..., master_phe=..., source_cugen_dir=...,
+                                phenotypes=[("INI50", False)], splits={...},
+                                out_dir=..., scratch_dir=...)
+    res = ultralasso.prs("INI50", splits_dir=..., cohorts_dir=..., score_cugen_dir=...,
+                         train_cugen_dir=..., trainval_cugen_dir=..., ref_npz=...,
+                         master_phe=..., step2_alpha=2e-4, out_dir=...)
+
 The canonical computation lives in the sibling flat modules
 (``cugen.screen``, ``cugen.lasso``, ``cugen.assoc``,
 ``cugen.loci``, ``cugen.finemapping``); this subpackage simply
@@ -46,6 +55,14 @@ from ..assoc import gwas, ultralasso_gwas as run
 from ..finemapping import ultramap as map_, ultrasusie as susie
 from ..lasso import fit_joint_lasso as fit
 from ..loci import define_loci as loci
+from ..prs import (
+    build_prs_splits, prs,
+    prs_load_phenotype, prs_residualize, prs_screen, prs_fit_weights, prs_score,
+    prs_alpha_sweep, select_best_alpha, prs_r2, prs_auc,
+)
 from ..screen import screen_chromosome as screen
 
-__all__ = ["screen", "fit", "gwas", "run", "loci", "susie", "map_"]
+__all__ = ["screen", "fit", "gwas", "run", "loci", "susie", "map_",
+           "prs", "build_prs_splits",
+           "prs_load_phenotype", "prs_residualize", "prs_screen", "prs_fit_weights",
+           "prs_score", "prs_alpha_sweep", "select_best_alpha", "prs_r2", "prs_auc"]
