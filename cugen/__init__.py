@@ -31,7 +31,7 @@ UltraMAP are step 5b of the *one* UltraLasso pipeline, so they live under
 PLINK / Hail aliases are wired in too (cg.keep, cg.glm, cg.freq, …).
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 
 def check_gpu():
