@@ -181,12 +181,18 @@ def _worker_gwas(args_tuple):
             sxx64 = sxx_block.astype(cp.float64)
             den64 = cp.maximum(sxx64, MIN_DEN)
             beta64 = beta_gpu.astype(cp.float64)
-            if test == "score":
-                # REGENIE-style score test: global null variance syy/(n-1).
-                # At MAC≈1 this stays bounded where per-variant RSS collapses.
-                # Note (session 13): empirically near-identical to Wald on our
-                # imputed data because rare-variant β̂ blowup is in the
-                # ESTIMATE (X'y / X'X), not the SE. Flag kept for completeness.
+            if test in ("score", "standardized"):
+                # REGENIE-style standardized score test T_linear =
+                # num/√(σ̂²_e·sxx), σ̂²_e = syy/(n-1) → se = √(σ̂²_e/sxx). Uses
+                # the PRECOMPUTED stored sxx (NOT a self-recompute): the value
+                # of .cugen is trustworthy precomputed stats, so a corrupt sxx
+                # is fixed by cg.repair, never by recomputing here (session 51).
+                # 'score' and 'standardized' are the SAME manuscript statistic
+                # (the latter is the REGENIE name); both kept as explicit opts.
+                # Global null variance stays bounded at MAC≈1 where per-variant
+                # RSS collapses. Session 13: near-identical to Wald on imputed
+                # data because rare-variant β̂ blowup is in the ESTIMATE
+                # (X'y / X'X), not the SE.
                 se64 = cp.sqrt(
                     cp.float64(syy)
                     / (cp.float64(n_samples - 1) * den64)
@@ -568,7 +574,11 @@ def gwas(
         ``predictions``/``y_original`` (LPM probability scale — bridged via
         ``eta = logit(clip(mu_LPM))``, matching the manuscript LPM-residual
         Methods). Reproduces ``step4_gwas_array_binary.py`` byte-for-byte.
-    test : 'wald' (production) or 'score' (REGENIE-style, MAC-robust in theory
+    test : 'wald' (production default), 'score', or 'standardized'. 'score' and
+        'standardized' are the same manuscript/REGENIE T_linear standardized
+        score (num/√(σ̂²_e·sxx)); 'standardized' is provided as the REGENIE name.
+        All three use the PRECOMPUTED stored sxx (never a self-recompute — repair
+        corrupt stats with cg.repair instead). Historically 'score' (REGENIE-style, MAC-robust in theory
         but empirically near-identical to Wald on imputed biobank — session 13).
         Ignored when ``family='binary'`` (always score + selective SPA).
     maf_min : MAF filter applied to the output (default 1e-4). Linear only;
@@ -596,8 +606,9 @@ def gwas(
     if family not in ("linear", "binary"):
         raise ValueError(
             f"gwas(family={family!r}): expected 'linear' or 'binary'.")
-    if family == "linear" and test not in ("wald", "score"):
-        raise ValueError(f"gwas(test={test!r}): expected 'wald' or 'score'.")
+    if family == "linear" and test not in ("wald", "score", "standardized"):
+        raise ValueError(
+            f"gwas(test={test!r}): expected 'wald', 'score', or 'standardized'.")
 
     cugen_dir = str(cugen_dir)
 

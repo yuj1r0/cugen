@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cugen"
-version = "0.1.5"
+version = "0.1.7"
 description = "GPU-accelerated UltraLasso / UltraSuSiE genomics pipeline with a PLINK/Hail-style Python API."
 readme = "README.md"
 license = { text = "MIT" }

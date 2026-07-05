@@ -105,7 +105,12 @@ def _get_fused_univariate_kernel():
                 long long packed_offset = var_idx * bytes_per_variant + byte_idx;
                 unsigned char byte_val = packed[packed_offset];
                 unsigned char geno = (byte_val >> bit_shift) & 0x03;
-                float x = (geno == 3) ? 0.0f : (float)geno;
+                if (geno == 3) continue;   // complete-case: EXCLUDE missing from the
+                                           // numerator (do NOT treat as dosage 0 — that
+                                           // adds spurious (0-mu)*y variance and inflates
+                                           // Z for high-missing/common-ALT variants).
+                                           // Matches the stored non-missing sxx. (session 52)
+                float x = (float)geno;
                 num += (double)(x - mu) * (double)y_centered[s];
             }
             num_out[var_idx] = (float)num;

@@ -31,7 +31,7 @@ UltraMAP are step 5b of the *one* UltraLasso pipeline, so they live under
 PLINK / Hail aliases are wired in too (cg.keep, cg.glm, cg.freq, …).
 """
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 
 def check_gpu():
@@ -75,6 +75,11 @@ from .subset import (
     subset_cugen_dir,
     subset_cugen_file,
 )
+
+# session 51: in-place stats-block repair (recompute mu_x/sxx/maf from the
+# file's own genotypes; fixes corrupt precomputed stats without recomputing
+# inside the association). cg.repair dispatches on file-vs-dir.
+from .repair import repair, repair_cugen_dir, repair_cugen_file
 
 # v0.1.3: real implementations for QC + PRS scoring. ld/popstruct still stubs.
 from .qc import sample_qc, variant_qc
@@ -131,6 +136,10 @@ __all__ = [
     "subset_cugen_dir",
     "filter_cols",
     "filter_rows",
+    # stats-block repair (session 51)
+    "repair",
+    "repair_cugen_file",
+    "repair_cugen_dir",
     # QC + PRS (v0.1.3)
     "variant_qc",
     "sample_qc",
