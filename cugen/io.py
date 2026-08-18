@@ -650,6 +650,34 @@ class CugenReaderPinned(CugenReader):
         return X_gpu
 
 
+def is_phased(path: str) -> bool:
+    """Is this .cugen file phased haplotypes, or unphased dosages?
+
+        >>> cg.is_phased("reference.cugen")
+        True
+
+    Reads the 256-byte header only -- it does not mmap the data block -- so it
+    is cheap enough to call on a directory of chromosomes.
+
+    RAISES on a file whose PHASED flag and encoding disagree, rather than
+    picking one. hap2bit and 2bit share bytes_per_variant, so such a file passes
+    every structural size check while decoding to different genotypes depending
+    on which field you believe: code 10 is dosage 2 unphased but 1|0 (dosage 1)
+    phased, and 11 is missing unphased but 1|1 (dosage 2) phased. There is no
+    correct answer to return, and returning either one silently is the failure
+    this whole encoding is guarded against.
+    """
+    h = read_cugen_header(path)
+    phased = bool(h["flags"] & FLAG_PHASED)
+    hap2bit = h["encoding"] == encoding_name(ENCODING_HAP2BIT)
+    if phased != hap2bit:
+        raise ValueError(
+            f"{path}: PHASED flag is {phased} but encoding is "
+            f"{h['encoding']!r}; the two disagree, so the file does not have a "
+            f"phasedness. Run cg.validate_cugen() on it.")
+    return phased
+
+
 def read_cugen_header(path: str) -> dict:
     """Parse a .cugen header without opening for I/O. Returns metadata dict.
 

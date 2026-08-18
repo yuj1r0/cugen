@@ -59,7 +59,7 @@ def set_device(device_id: int):
 
 
 # --- canonical API ---
-from .io import CugenReader, read_cugen, read_cugen_header
+from .io import CugenReader, is_phased, read_cugen, read_cugen_header
 from .prep_cohort import prepare_cohort
 from .screen import screen_chromosome
 from .lasso import fit_joint_lasso
