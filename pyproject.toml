@@ -37,7 +37,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x>=12.0"]
 plot = ["matplotlib>=3.7"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "cyvcf2>=0.30"]
 
 [project.scripts]
 cugen = "cugen.cli:main"
