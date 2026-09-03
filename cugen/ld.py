@@ -141,7 +141,7 @@ import time as _time
 import numpy as np
 import pandas as pd
 
-from .io import ENCODING_2BIT, read_cugen
+from .io import ENCODING_2BIT, ENCODING_HAP2BIT, read_cugen
 
 try:
     import cupy as cp
@@ -167,8 +167,24 @@ except ImportError:                                            # noqa: BLE001
 __all__ = ["ld_matrix", "ld_clump", "ld_prune", "LDMatrix"]
 
 EPS = 1e-12
-_STATS = ("r", "r2", "r2_signed", "d", "dp")
-_STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP"}
+# _STATS is the VALIDATION set (every legal name, and the canonical column
+# order). _DEFAULT_STATS is what a caller gets when they ask for nothing --
+# deliberately dosage-only, so adding a phased statistic here never changes
+# the result of an existing call.
+_STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
+          "d_phased", "dp_phased", "r2_phased_em")
+_DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
+_STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
+             "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
+             "d_phased": "D_PHASED", "dp_phased": "DP_PHASED",
+             "r2_phased_em": "R2_PHASED_EM"}
+# Statistics computed from TRUE haplotype counts, which only a HAP2BIT file
+# carries. Mixing these with the dosage statistics in one call is refused
+# rather than silently served: hap2bit and 2bit share bytes but not meaning
+# (see cugen.write), so a caller who asks for "r" on a phased file is asking
+# for a number that path cannot produce.
+_PHASED_STATS = frozenset(("r_phased", "r2_phased", "d_phased",
+                           "dp_phased"))
 _FP32_EXACT_MAX_SAMPLES = (1 << 24) // 4      # 4*n must stay below 2**24
 _TF32_MIN_CC = 80                             # Ampere; earlier cards have none
 
@@ -342,6 +358,9 @@ def ld_from_counts(counts, dprime_method: str = "phased"):
                              np.nan), -1.0, 1.0)
         qAf, qBf = 1.0 - pA, 1.0 - pB
 
+        # The cubic below already recovers D from estimated haplotype
+        # frequencies. r2_phased_em is that D expressed as a correlation --
+        # the same quantity plink2 --r2-phased reports on unphased input.
         if dprime_method == "composite":
             # Burrows' composite measure; see Weir (1979). This inverts the
             # haplotypic identity r = D/sqrt(pA qA pB qB) and is NOT a phase
@@ -384,10 +403,19 @@ def ld_from_counts(counts, dprime_method: str = "phased"):
         DP = np.where(good, np.where(dmax > EPS,
                                      np.clip(D / dmax, -1.0, 1.0), 0.0), np.nan)
 
+        # r2_phased_em: the SAME D the cubic just solved for, expressed as a
+        # correlation. This is what plink2 --r2-phased reports on unphased
+        # input -- an EM/likelihood ESTIMATE of phase, not observed phase. For
+        # observed phase use a hap2bit file and r2_phased.
+        den = pA * qAf * pB * qBf
+        r2_em = np.where(good & (den > EPS),
+                         np.clip(D * D / np.where(den > EPS, den, 1.0), 0.0, 1.0),
+                         np.nan)
+
     return {"n": n, "pA": pA, "pB": pB, "r": r,
             "r2": np.clip(r * r, 0.0, 1.0),
             "r2_signed": np.clip(r * np.abs(r), -1.0, 1.0),
-            "d": D, "dp": DP}
+            "d": D, "dp": DP, "r2_phased_em": r2_em}
 
 
 def contingency_tables(dosages, pairs):
@@ -1372,7 +1400,8 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
 
     # Per-variant moments once, streamed -- identical to the banded scan.
     _t0 = _time.perf_counter()
-    s_v, q_v = _variant_moments(packed, p, ns, bpv)
+    s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
+                else _variant_moments(packed, p, ns, bpv))
     cp.cuda.Stream.null.synchronize()
     _t_mom = _time.perf_counter() - _t0
 
@@ -2022,6 +2051,99 @@ void build_g_plane(const unsigned char* packed, float* G,
 
 assert _LD_G_ONLY_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
 
+# hap2bit stores haplotype j in byte j>>3 at bit 7-(j&7) (see cugen/write.py).
+# For j = 2i and j = 2i+1 those are the high and low bits of sample i's 2-bit
+# field -- the same bytes as the dosage plane, read one bit at a time.
+_LD_H_ONLY_SRC = r'''
+extern "C" __global__
+void build_h_plane(const unsigned char* packed, float* H,
+                   const long long n_haps,
+                   const long long n_variants,
+                   const long long bytes_per_variant)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = n_variants * n_haps;
+    if (idx >= total) return;
+    long long v = idx / n_haps;
+    long long j = idx - v * n_haps;
+    unsigned char byte = packed[v * bytes_per_variant + (j >> 3)];
+    H[idx] = (float)((byte >> (7 - (j & 7))) & 1);
+}
+
+extern "C" __global__
+void hap_moments(const unsigned char* packed, float* s_v, float* q_v,
+                 const long long n_haps,
+                 const long long n_variants,
+                 const long long bytes_per_variant)
+{
+    long long v = blockIdx.x;
+    if (v >= n_variants) return;
+    __shared__ long long acc[256];
+    long long local = 0;
+    for (long long j = threadIdx.x; j < n_haps; j += blockDim.x) {
+        unsigned char byte = packed[v * bytes_per_variant + (j >> 3)];
+        local += (byte >> (7 - (j & 7))) & 1;
+    }
+    acc[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) acc[threadIdx.x] += acc[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        // 0/1 alleles: sum(x*x) == sum(x), which is why the dosage epilogue
+        // works unchanged on a haplotype plane.
+        s_v[v] = (float)acc[0];
+        q_v[v] = (float)acc[0];
+    }
+}
+'''
+
+assert _LD_H_ONLY_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
+_LD_H_ONLY_KERNEL = None
+_LD_H_MOMENTS_KERNEL = None
+
+
+def _get_h_only_kernel():
+    global _LD_H_ONLY_KERNEL
+    if _LD_H_ONLY_KERNEL is None and HAS_CUPY:
+        _LD_H_ONLY_KERNEL = cp.RawKernel(_LD_H_ONLY_SRC, "build_h_plane")
+    return _LD_H_ONLY_KERNEL
+
+
+def _get_h_moments_kernel():
+    global _LD_H_MOMENTS_KERNEL
+    if _LD_H_MOMENTS_KERNEL is None and HAS_CUPY:
+        _LD_H_MOMENTS_KERNEL = cp.RawKernel(_LD_H_ONLY_SRC, "hap_moments")
+    return _LD_H_MOMENTS_KERNEL
+
+
+def _build_h(packed2d, lo, hi, n_haps, bytes_per_variant, out=None):
+    """Haplotype plane (0/1) for the CONTIGUOUS row range [lo, hi).
+
+    The dosage twin of this is _build_g; the same slice-not-fancy-index rule
+    applies and for the same measured reason.
+    """
+    b, nh = int(hi - lo), int(n_haps)
+    blk = packed2d[lo:hi].ravel()                  # view, not a copy
+    H = out if out is not None else cp.empty((b, nh), dtype=cp.float32)
+    tpb = 256
+    total = b * nh
+    _get_h_only_kernel()(((total + tpb - 1) // tpb,), (tpb,),
+                         (blk, H, np.int64(nh), np.int64(b),
+                          np.int64(bytes_per_variant)))
+    return H[:b] if out is not None else H
+
+
+def _hap_moments(packed, p, nh, bpv):
+    """Per-variant allele count; q_v == s_v because the alleles are 0/1."""
+    s_v = cp.empty(p, dtype=cp.float32)
+    q_v = cp.empty(p, dtype=cp.float32)
+    _get_h_moments_kernel()((int(p),), (256,),
+                            (packed, s_v, q_v, np.int64(nh), np.int64(p),
+                             np.int64(bpv)))
+    return s_v, q_v
+
 
 def _get_g_only_kernel():
     global _LD_G_ONLY_KERNEL
@@ -2264,13 +2386,17 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
 
 
 def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
-                    verbose=False, tf32=False):
+                    verbose=False, tf32=False, phased=False):
     """Fused scan: one kernel per tile, one output buffer, no per-tile sync.
 
     Only for the clean r-only case (no missingness, no bp window). Everything
     else falls back to _scan_gpu. Returns device arrays (idx_i, idx_j, r).
     """
-    ns = int(reader.n_samples)
+    # A phased file contributes 2 haplotype columns per sample; everything
+    # downstream (tile planner, GEMM, epilogue) is a function of that width
+    # only, so the phased path differs solely in ns and the plane builder.
+    ns = 2 * int(reader.n_samples) if phased else int(reader.n_samples)
+    build_plane = _build_h if phased else _build_g
     bpv = int(reader.bytes_per_variant)
     p = len(rows)
     B = int(tile_size) if tile_size else _tile_size_for(
@@ -2289,7 +2415,8 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     # n=500,000 to compute 160 KB of output, and it dominated the run at large
     # n. The kernel reads the 2-bit data once, writes only the sums, and stays
     # bit-exact by accumulating in integers.
-    s_v, q_v = _variant_moments(packed, p, ns, bpv)
+    s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
+                else _variant_moments(packed, p, ns, bpv))
 
     def run(capacity):
         # Set the cuBLAS math mode ONCE for the whole scan. Doing it per GEMM
@@ -2308,13 +2435,13 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
             for i0 in range(0, p, B):
                 i1 = min(i0 + B, p)
                 hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
-                Ga = _build_g(packed, i0, i1, ns, bpv, out=bufA)
+                Ga = build_plane(packed, i0, i1, ns, bpv, out=bufA)
                 for j0 in range(i0, hi, B):
                     j1 = min(j0 + B, hi)
                     if j0 == i0:
                         Gb = Ga
                     else:
-                        Gb = _build_g(packed, j0, j1, ns, bpv, out=bufB)
+                        Gb = build_plane(packed, j0, j1, ns, bpv, out=bufB)
                     S = Ga @ Gb.T
                     bi, bj = i1 - i0, j1 - j0
                     nthread = bi * bj
@@ -2385,9 +2512,63 @@ def _assemble_device(pairs_dev, payload, reader, rows, stats, sign_reference,
         g["R2"] = r2.astype(cp.float32)
     if "r2_signed" in stats:
         g["R2_SIGNED"] = cp.clip(r * cp.abs(r), -1.0, 1.0).astype(cp.float32)
+    # the fused epilogue returns one correlation; which column it IS depends on
+    # whether the plane it ran over was dosages or haplotypes
+    if "r_phased" in stats:
+        g["R_PHASED"] = r.astype(cp.float32)
+    if "r2_phased" in stats:
+        g["R2_PHASED"] = r2.astype(cp.float32)
     g["gidx_a"] = gidx_dev[ia]
     g["gidx_b"] = gidx_dev[ib]
     return g
+
+
+def _haplotypes_numpy(reader) -> np.ndarray:
+    """(n_variants, 2*n_samples) uint8 0/1 alleles, no CuPy required."""
+    from .write import unpack_hap2bit
+    packed = np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8)
+    bpv = int(reader.bytes_per_variant)
+    p, H = int(reader.n_variants), 2 * int(reader.n_samples)
+    return np.stack([unpack_hap2bit(packed[v * bpv:(v + 1) * bpv], H)
+                     for v in range(p)])
+
+
+def phased_from_haplotypes(hap, pairs):
+    """r and r^2 from 0/1 haplotype rows -- no EM, no cubic.
+
+    `hap` is (n_variants, H) of 0/1; `pairs` is (n_pairs, 2) of row indices.
+
+    For 0/1 indicators sum(x^2) == sum(x), so the Hill & Robertson allele-count
+    correlation collapses to the haplotypic identity exactly:
+
+        r = (H*nAB - nA*nB) / sqrt(nA(H-nA) * nB(H-nB))
+          = D / sqrt(pA qA pB qB),   D = nAB/H - pA pB
+
+    A HAP2BIT file cannot encode missingness, so every pair is complete and
+    n == H unconditionally.
+    """
+    h = np.asarray(hap)
+    H = float(h.shape[1])
+    x = h[pairs[:, 0]].astype(np.float64)
+    y = h[pairs[:, 1]].astype(np.float64)
+    nA, nB = x.sum(axis=1), y.sum(axis=1)
+    nAB = (x * y).sum(axis=1)
+    pA, pB = nA / H, nB / H
+    vA, vB = nA * (H - nA), nB * (H - nB)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        good = (vA > 0) & (vB > 0)
+        r = np.clip(np.where(good, (H * nAB - nA * nB)
+                             / (np.sqrt(vA) * np.sqrt(vB)), np.nan), -1.0, 1.0)
+        D = nAB / H - pA * pB
+        qA, qB = 1.0 - pA, 1.0 - pB
+        # Lewontin (1964): normalise by the largest |D| the margins permit.
+        # The branch is on the SIGN of D, not on which product is smaller.
+        dmax = np.where(D > 0, np.minimum(pA * qB, qA * pB),
+                        np.minimum(pA * pB, qA * qB))
+        dp = np.where(good & (dmax > 0), D / dmax, np.nan)
+    return {"r_phased": r, "r2_phased": r * r, "d_phased": np.where(good, D, np.nan),
+            "dp_phased": dp, "pA": pA, "pB": pB,
+            "n": np.full(pairs.shape[0], H)}
 
 
 def _dosages_numpy(reader) -> np.ndarray:
@@ -2515,7 +2696,7 @@ def ld_matrix(
     window: Optional[int] = None,
     window_kb: Optional[float] = None,
     min_r2: float = 0.0,
-    stats: Sequence[str] = _STATS,
+    stats: Sequence[str] = _DEFAULT_STATS,
     dprime_method: str = "phased",
     sign_reference: str = "alt",
     missing: str = "pairwise",
@@ -2627,11 +2808,24 @@ def ld_matrix(
             "path (correct but not fast).")
 
     reader = read_cugen(path, device=device)
-    if int(reader.encoding) != ENCODING_2BIT:
+    want_phased = [s for s in stats if s in _PHASED_STATS]
+    want_dosage = [s for s in stats if s not in _PHASED_STATS]
+    enc = int(reader.encoding)
+    if enc == ENCODING_HAP2BIT:
+        if want_dosage:
+            raise ValueError(
+                f"{path} is phased (hap2bit); {want_dosage} are dosage "
+                f"statistics. hap2bit and 2bit share bytes but not meaning, so "
+                f"serving them here would return plausible wrong numbers. Ask "
+                f"for {sorted(_PHASED_STATS)} instead.")
+    elif enc != ENCODING_2BIT:
         raise NotImplementedError(
             f"cugen.ld requires 2-bit encoding (encoding={ENCODING_2BIT}); this "
-            f"file has encoding={int(reader.encoding)}. Re-convert with "
-            f"cg.convert.")
+            f"file has encoding={enc}. Re-convert with cg.convert.")
+    elif want_phased:
+        raise ValueError(
+            f"{want_phased} need TRUE phase, which a 2bit file does not carry. "
+            f"Convert a phased VCF with cg.convert.vcf2cugenh().")
 
     p_all = int(reader.n_variants)
     gidx_all = np.asarray(reader.gidx, dtype=np.int64)
@@ -2687,18 +2881,24 @@ def ld_matrix(
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
     # where the device was sitting at 1-4% SM utilisation.
+    # A hap2bit file cannot encode missingness at all, so the no-missing
+    # precondition is structural there rather than a property of this file.
+    fused_ok_phased = (not want_phased
+                       or set(want_phased) <= {"r_phased", "r2_phased"})
     fused = (on_device and not reader.has_missing and window_kb is None
-             and min_obs <= reader.n_samples)
+             and min_obs <= reader.n_samples and fused_ok_phased)
 
     if use_gpu and fused:
         cp.cuda.Device(device).use()
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
                                      tile_size=tile_size, verbose=verbose,
-                                     tf32=use_tf32)
+                                     tf32=use_tf32, phased=bool(want_phased))
         if ii.size == 0:
             return _empty_pairs(stats)
         pairs_local = cp.stack([ii, jj], axis=1)
-        n_dev = cp.full(ii.size, float(reader.n_samples), dtype=cp.float32)
+        n_obs = (2 * int(reader.n_samples) if want_phased
+                 else int(reader.n_samples))
+        n_dev = cp.full(ii.size, float(n_obs), dtype=cp.float32)
         df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                               sign_reference, path, verbose, n_planned=n_pairs)
         _write_df(df, str(output))
@@ -2730,22 +2930,31 @@ def ld_matrix(
             res = _r_only_result(r_arr, n_arr, reader, rows, pairs_local)
     else:
         pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
-        dos = _dosages_numpy(reader)[rows]
-        tables = contingency_tables(dos, pairs_local)
-        res = ld_from_counts(tables, dprime_method=dprime_method)
+        if want_phased:
+            hap = _haplotypes_numpy(reader)[rows]
+            res = phased_from_haplotypes(hap, pairs_local)
+        else:
+            dos = _dosages_numpy(reader)[rows]
+            tables = contingency_tables(dos, pairs_local)
+            res = ld_from_counts(tables, dprime_method=dprime_method)
 
     # ---- orientation -----------------------------------------------------
     # Flipping BOTH variants leaves r unchanged; flipping exactly one negates
     # r, D and D'. plink2 orients by the major allele (Chang et al. 2015).
     if sign_reference == "major":
         flip = (res["pA"] > 0.5) ^ (res["pB"] > 0.5)
-        for k in ("r", "r2_signed", "d", "dp"):
+        for k in ("r", "r2_signed", "d", "dp", "r_phased", "d_phased",
+                  "dp_phased"):
             if k in res:
                 res[k] = np.where(flip, -res[k], res[k])
 
-    keep = np.isfinite(res["r"]) & (res["n"] >= min_obs)
+    # the phased path produces r_phased and no dosage r; filter on whichever
+    # this call actually computed rather than assuming "r" is present
+    r_key = "r" if "r" in res else "r_phased"
+    r2_key = "r2" if "r2" in res else "r2_phased"
+    keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
     if min_r2 > 0:
-        keep &= res["r2"] >= min_r2
+        keep &= res[r2_key] >= min_r2
     idx = np.flatnonzero(keep)
     if idx.size == 0:
         return _empty_pairs(stats)
