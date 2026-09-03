@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared by requires-python, plus a current release. Testing
+        # only the newest would leave the >=3.10 claim unverified.
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set Python version
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: printf '%s\n' "$PYTHON_VERSION" > .python-version
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      # CPU-only. The GPU statistics are covered two ways and neither needs a
+      # CUDA runner here: eight tests carry `@pytest.mark.gpu` and are
+      # deselected by -m, and the rest are `skipif`-gated on a `try: import
+      # cupy` probe in tests/conftest.py, so they skip rather than error. Run
+      # the suite without -m on a CUDA box to exercise those.
+      - name: Run tests
+        run: uv run pytest -m "not gpu" -q
