@@ -229,7 +229,7 @@ def test_unsorted_positions_raise():
 def test_empty_result_keeps_full_schema(small_cugen):
     df = L.ld_matrix(small_cugen[0], min_r2=1.01, **CPU)
     assert len(df) == 0
-    assert list(df.columns) == list(L._empty_pairs(L._STATS).columns)
+    assert list(df.columns) == list(L._empty_pairs(L._DEFAULT_STATS).columns)
     assert df["N_OBS"].dtype == np.int32
     assert df["R"].dtype == np.float32
 
