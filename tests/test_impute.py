@@ -908,3 +908,51 @@ def test_mosaic_reaches_impute_haplotypes():
     assert abs(m120 - w120) < 0.05, got
     # and the advantage must GROW as states get scarcer -- that is the claim
     assert (m16 - w16) > (m120 - w120), got
+
+
+# --------------------------------------------------------------------------
+# is_phased
+# --------------------------------------------------------------------------
+
+def test_is_phased_reports_both_kinds(tmp_path):
+    from cugen.write import write_cugen
+    rng = np.random.default_rng(0)
+    ph, un = tmp_path / "ph.cugen", tmp_path / "un.cugen"
+    write_cugen_phased(str(ph), rng.integers(0, 2, size=(2 * 20, 50)).astype(np.uint8))
+    write_cugen(str(un), rng.integers(0, 3, size=(20, 50)).astype(np.uint8))
+    assert cio.is_phased(str(ph)) is True
+    assert cio.is_phased(str(un)) is False
+
+
+def test_is_phased_refuses_a_file_whose_flag_and_encoding_disagree(tmp_path):
+    """There is no correct answer for such a file, so it must not return one.
+
+    hap2bit and 2bit share bytes_per_variant, so the file passes every
+    structural check while decoding to different genotypes depending on which
+    field you believe.
+    """
+    rng = np.random.default_rng(2)
+    p = tmp_path / "bad.cugen"
+    write_cugen_phased(str(p), rng.integers(0, 2, size=(8, 6)).astype(np.uint8))
+    raw = bytearray(p.read_bytes())
+    raw[64] &= ~cwrite.FLAG_PHASED          # clear PHASED, keep hap2bit
+    p.write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match="disagree"):
+        cio.is_phased(str(p))
+
+
+def test_is_phased_does_not_read_the_data_block(tmp_path, monkeypatch):
+    """It must stay cheap enough to call across a directory of chromosomes.
+
+    Asserted by forbidding mmap rather than by timing, which would be flaky.
+    """
+    import mmap as _mmap
+    rng = np.random.default_rng(1)
+    p = tmp_path / "ph.cugen"
+    write_cugen_phased(str(p), rng.integers(0, 2, size=(2 * 30, 400)).astype(np.uint8))
+
+    def _boom(*a, **k):
+        raise AssertionError("is_phased mmap'd the file")
+
+    monkeypatch.setattr(_mmap, "mmap", _boom)
+    assert cio.is_phased(str(p)) is True
