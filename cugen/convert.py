@@ -113,7 +113,21 @@ def vcf2cugen(vcf, out, region=None, keep=None, gidx_start=0,
             raise ImportError("vcf2cugen needs cyvcf2 or pysam")
 
     def _open():
-        return VCF(vcf) if backend == "cyvcf2" else pysam.VariantFile(vcf)
+        # gts012=True is load-bearing, not a preference. cyvcf2's DEFAULT
+        # gt_types encoding is 0=HOM_REF, 1=HET, 2=UNKNOWN, 3=HOM_ALT; only
+        # with gts012=True does it become 0/1/2 dosage plus 3 for missing,
+        # which is what the mapping below assumes and what ENCODING_2BIT
+        # means. Without it every homozygous-ALT call is written as MISSING and
+        # every missing call as dosage 2 -- silently, with plausible output.
+        # Measured on real 1000 Genomes chr22: a variant with 2,321 `1|1`
+        # genotypes produced 2,321 missing and zero dosage-2, and the spurious
+        # HAS_MISSING flag then disabled the fused GPU scan, stream= and
+        # count_only for the whole file.
+        #
+        # vcf2cugenh does not need this: it reads allele indices through
+        # rec.genotypes, which gts012 does not affect.
+        return (VCF(vcf, gts012=True) if backend == "cyvcf2"
+                else pysam.VariantFile(vcf))
 
     v = _open()
     samples = list(v.samples if backend == "cyvcf2" else v.header.samples)
@@ -139,7 +153,8 @@ def vcf2cugen(vcf, out, region=None, keep=None, gidx_start=0,
     with CugenWriter(out, n_samples, n_var, ENCODING_2BIT) as w:
         for k, rec in enumerate(it):
             if backend == "cyvcf2":
-                gt = rec.gt_types.astype(np.float64)     # 0,1,2 ; 3 = UNKNOWN
+                # gts012=True, so 0,1,2 are dosages and 3 is UNKNOWN.
+                gt = rec.gt_types.astype(np.float64)
                 d = np.where(gt == 3, 3.0, gt)
             else:
                 d = np.empty(len(rec.samples), dtype=np.float64)
