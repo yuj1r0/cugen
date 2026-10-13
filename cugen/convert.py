@@ -366,3 +366,74 @@ def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
     v.close()
     _write_samples(out, samples)
     return out
+
+
+def merge_cugen(paths, out, gidx_start=0, verbose=True):
+    """Concatenate per-chromosome .cugen files into one genome-wide file.
+
+    Cross-chromosome LD is not expressible against a directory: ld_matrix takes
+    a SINGLE .cugen. A genome-wide all-pairs scan therefore needs every variant
+    in one file, with gidx numbered continuously so downstream joins still
+    identify variants uniquely.
+
+    Refuses rather than guesses on the two mismatches that would otherwise
+    produce a well-formed and wrong file:
+
+    * differing n_samples -- concatenating two cohorts on the variant axis
+      silently pairs sample i of one with sample i of the other.
+    * differing encoding -- 2bit and hap2bit share bytes but not meaning (see
+      cugen.write), so a mixed file decodes correctly for part of its range and
+      wrongly for the rest, with no structural signal that anything is amiss.
+
+    Variants keep source order; the caller controls chromosome order by the
+    order of `paths`.
+    """
+    from .io import read_cugen, read_cugen_header
+    from .write import ENCODING_HAP2BIT, unpack_2bit, unpack_hap2bit
+    paths = [str(x) for x in paths]
+    if not paths:
+        raise ValueError("no input paths given")
+
+    heads = [read_cugen_header(x) for x in paths]
+    ns = {int(h["n_samples"]) for h in heads}
+    if len(ns) != 1:
+        raise ValueError(
+            f"cannot merge: n_samples differs across inputs ({sorted(ns)}). "
+            f"These are different cohorts, not different chromosomes.")
+    encs = {h["encoding"] for h in heads}
+    if len(encs) != 1:
+        raise ValueError(
+            f"cannot merge: encoding differs across inputs ({sorted(encs)}). "
+            f"2bit and hap2bit share bytes but not meaning, so a mixed file "
+            f"would decode wrongly for part of its range.")
+
+    n_samples = ns.pop()
+    enc_name = encs.pop()
+    total = sum(int(h["n_variants"]) for h in heads)
+    enc = ENCODING_HAP2BIT if enc_name == "hap2bit" else ENCODING_2BIT
+    if verbose:
+        print(f"merge_cugen: {len(paths)} files, {total:,} variants x "
+              f"{n_samples:,} samples, encoding={enc_name} -> {out}")
+
+    k = 0
+    with CugenWriter(out, n_samples, total, encoding=enc) as w:
+        for path, h in zip(paths, heads):
+            r = read_cugen(path)
+            bpv = int(r.bytes_per_variant)
+            packed = np.frombuffer(r.read_packed_bytes(), dtype=np.uint8)
+            nv = int(h["n_variants"])
+            for v in range(nv):
+                rec = packed[v * bpv:(v + 1) * bpv]
+                # Decode through the encoding's OWN unpacker and re-add. Both
+                # round-trip exactly, and this keeps the writer's per-variant
+                # stats (mu_x, sxx, maf) correct -- a raw byte copy would
+                # produce a file whose stats block describes nothing.
+                if enc == ENCODING_HAP2BIT:
+                    w.add_variant_phased(gidx_start + k,
+                                         unpack_hap2bit(rec, 2 * n_samples))
+                else:
+                    w.add_variant(gidx_start + k, unpack_2bit(rec, n_samples))
+                k += 1
+            if verbose:
+                print(f"  {path}: +{nv:,} variants ({k:,}/{total:,})")
+    return out
