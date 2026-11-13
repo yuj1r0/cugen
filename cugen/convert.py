@@ -171,13 +171,25 @@ def vcf2cugen(vcf, out, region=None, keep=None, gidx_start=0,
     return out
 
 
-def bed2cugen(bed, out, bim=None, fam=None, gidx_start=0, verbose=True):
+def bed2cugen(bed, out, bim=None, fam=None, gidx_start=0, verbose=True, counted="A2",
+              annotation=None):
     """PLINK1 .bed -> .cugen. Pure numpy, no external dependency.
 
     PLINK1 packs 2 bits per genotype LITTLE-endian within the byte, with codes
     00=hom-A1, 01=MISSING, 10=het, 11=hom-A2. cugen uses BIG-endian within the
     byte with 0/1/2 dosage and 3=missing, so every genotype is remapped.
+
+    counted    : which .bim allele the cugen dosages count, in the vocabulary shared
+                 with :class:`cugen.genotypes.BedGenotypes`: "A2" (default; column 6,
+                 unchanged behaviour) or "A1" (column 5, the PLINK / REGENIE allele).
+                 Note plink2 writes ALT in column 5. Reading the same .bed with
+                 ``BedGenotypes(counted="A1")`` and a default cugen gives opposite signs.
+    annotation : optional path (.feather or .parquet): also write the variant annotation
+                 gidx, CHR, POS, ID, REF, ALT with ALT = the counted allele and REF = the
+                 other one, i.e. the annotation that step 4 expects for this file.
     """
+    from ._codec import bed_lut, check_counted, decode
+    check_counted(counted)
     bim = bim or os.path.splitext(bed)[0] + ".bim"
     fam = fam or os.path.splitext(bed)[0] + ".fam"
     ids = [l.split()[1] for l in open(fam) if l.strip()]
@@ -193,22 +205,38 @@ def bed2cugen(bed, out, bim=None, fam=None, gidx_start=0, verbose=True):
                              f"re-encode with --make-bed")
         bpv = (n_samples + 3) // 4
         if verbose:
-            print(f"bed2cugen: {n_samples:,} samples x {n_var:,} variants -> {out}")
-        # PLINK1 code -> dosage; 1 (01) is missing
-        lut = np.array([0.0, 3.0, 1.0, 2.0], dtype=np.float64)
+            print(f"bed2cugen: {n_samples:,} samples x {n_var:,} variants -> {out} "
+                  f"(counting bim {counted}, column {5 if counted == 'A1' else 6})")
+        # PLINK1 code -> count of the counted allele (3 = missing), via the shared codec
+        lut = bed_lut(counted)
         with CugenWriter(out, n_samples, n_var, ENCODING_2BIT) as w:
             for k in range(n_var):
                 raw = np.frombuffer(f.read(bpv), dtype=np.uint8)
-                codes = np.empty(raw.size * 4, dtype=np.uint8)
-                codes[0::4] = raw & 3           # little-endian within byte
-                codes[1::4] = (raw >> 2) & 3
-                codes[2::4] = (raw >> 4) & 3
-                codes[3::4] = (raw >> 6) & 3
-                w.add_variant(gidx_start + k, lut[codes[:n_samples]])
+                counts = decode(raw, lut, n_samples)[0]
+                w.add_variant(gidx_start + k, counts.astype(np.float64))
                 if verbose:
                     _progress(k, n_var)
     _write_samples(out, ids)
+    if annotation is not None:
+        _write_bed_annotation(bim, annotation, counted, gidx_start)
     return out
+
+
+def _write_bed_annotation(bim, path, counted, gidx_start=0):
+    """gidx/CHR/POS/ID/REF/ALT from a .bim, ALT = the counted allele."""
+    import pandas as pd
+    b = pd.read_csv(bim, sep=r"\s+", header=None, dtype={0: str, 1: str, 4: str, 5: str},
+                    names=["CHR", "ID", "CM", "POS", "A1", "A2"])
+    alt, ref = ("A1", "A2") if counted == "A1" else ("A2", "A1")
+    ann = pd.DataFrame({"gidx": np.arange(gidx_start, gidx_start + len(b), dtype=np.int64),
+                        "CHR": b["CHR"], "POS": b["POS"].astype(np.int64), "ID": b["ID"],
+                        "REF": b[ref], "ALT": b[alt]})
+    path = str(path)
+    if path.endswith(".parquet"):
+        ann.to_parquet(path, index=False)
+    else:
+        ann.reset_index(drop=True).to_feather(path)
+    return path
 
 
 def main(argv=None):
@@ -224,6 +252,9 @@ def main(argv=None):
     b = sub.add_parser("bed"); b.add_argument("input"); b.add_argument("output")
     b.add_argument("--bim"); b.add_argument("--fam")
     b.add_argument("--gidx-start", type=int, default=0)
+    b.add_argument("--counted", choices=["A1", "A2"], default="A2",
+                   help="bim allele the dosages count (default A2, column 6)")
+    b.add_argument("--annotation", help="also write gidx/CHR/POS/ID/REF/ALT (ALT = counted) here")
     a = ap.parse_args(argv)
 
     if a.cmd == "pgen":
@@ -233,7 +264,8 @@ def main(argv=None):
                   gidx_start=a.gidx_start)
     else:
         bed2cugen(a.input, a.output, bim=a.bim, fam=a.fam,
-                  gidx_start=a.gidx_start)
+                  gidx_start=a.gidx_start, counted=a.counted,
+                  annotation=a.annotation)
     from .write import validate_cugen
     validate_cugen(a.output)
     return 0

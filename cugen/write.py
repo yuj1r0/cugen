@@ -124,24 +124,14 @@ _ENC_BYTES = {ENCODING_2BIT: lambda n: (n + 3) // 4,
 
 def pack_2bit(geno_u8):
     """Pack uint8 genotypes (0,1,2,3) into 2-bit, big-endian within byte."""
-    g = np.asarray(geno_u8, dtype=np.uint8)
-    n = g.size
-    pad = (-n) % 4
-    if pad:
-        g = np.concatenate([g, np.zeros(pad, dtype=np.uint8)])
-    r = g.reshape(-1, 4)
-    return ((r[:, 0] << 6) | (r[:, 1] << 4) | (r[:, 2] << 2) | r[:, 3]).astype(np.uint8)
+    from ._codec import pack_cugen
+    return pack_cugen(np.asarray(geno_u8, dtype=np.uint8).reshape(1, -1))[0]
 
 
 def unpack_2bit(packed, n_samples):
     """Inverse of pack_2bit; returns uint8 with 3 = missing."""
-    b = np.frombuffer(packed, dtype=np.uint8)
-    out = np.empty(b.size * 4, dtype=np.uint8)
-    out[0::4] = (b >> 6) & 3
-    out[1::4] = (b >> 4) & 3
-    out[2::4] = (b >> 2) & 3
-    out[3::4] = b & 3
-    return out[:n_samples]
+    from ._codec import unpack_cugen
+    return unpack_cugen(np.frombuffer(packed, dtype=np.uint8).reshape(1, -1), n_samples)[0]
 
 
 def pack_hap2bit(alleles):

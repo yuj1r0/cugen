@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cugen"
 version = "0.1.7"
-description = "GPU-accelerated UltraLasso / UltraSuSiE genomics pipeline with a PLINK/Hail-style Python API."
+description = "UltraLasso / UltraSuSiE genomics pipeline (GPU at biobank scale) with CPU-or-GPU LOCO backgrounds (CuGenie, CuGenie-K, UltraLOCO) and a PLINK/Hail-style Python API."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = [
     "genomics", "GWAS", "LASSO", "fine-mapping", "UKBB",
-    "polygenic-score", "GPU", "CUDA",
+    "polygenic-score", "GPU", "CUDA", "CPU", "REGENIE", "mixed-model", "LOCO",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
