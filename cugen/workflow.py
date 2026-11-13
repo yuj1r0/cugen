@@ -127,6 +127,25 @@ def _chunk_bounds(n_variants: int, k: int) -> list:
             if edges[i + 1] > edges[i]]
 
 
+def _loco_for_finemapping(loco_for_fm, loco_npz_path, res3=None):
+    """LOCO input in a form the fine-mapping loader accepts (an NPZ path or a dict).
+
+    With step 3 run in-process and a single fine-mapping worker, ``loco`` is the
+    bare (n, n_chrom) prediction array, which the loader rejects (TypeError), so
+    single-worker fine-mapping after step 3 never ran. Use the NPZ step 3 saved
+    when it exists, else the ``{"predictions", "y_original"}`` dict built from
+    the step-3 result. Paths and dicts are returned unchanged.
+    """
+    if isinstance(loco_for_fm, (str, Path, dict)) or loco_for_fm is None:
+        return loco_for_fm
+    loco_npz_path = Path(loco_npz_path)
+    if loco_npz_path.exists():
+        return str(loco_npz_path)
+    if res3 is not None:
+        return {"predictions": loco_for_fm, "y_original": res3["y_original"]}
+    return loco_for_fm
+
+
 def ultra_workflow(config: Union[str, Path, dict],
                    dry_run: bool = False) -> dict:
     """Run the full UltraLasso pipeline from a JSON config.
@@ -302,6 +321,18 @@ def ultra_workflow(config: Union[str, Path, dict],
 
         # --- Step 3: joint LASSO + LOCO ----------------------------------
         if cfg["step3_global_lasso"]["run"]:
+            # Drain the CuPy pool before step 3, as is done before step 4.
+            # Steps 1-2 leave tens of GB cached in the pool; step 3's per-
+            # chromosome LOCO refits then allocate on top of that and can run
+            # out of memory for large active sets. Running each step as a
+            # separate process hides this (the pool dies with the process);
+            # ultra_workflow runs them all in one process.
+            try:
+                import cupy as _cp
+                _cp.get_default_memory_pool().free_all_blocks()
+                _cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:  # noqa: BLE001
+                pass
             t = time.time()
             res3 = _fit_joint_lasso(
                 candidates=candidates,
@@ -421,6 +452,9 @@ def ultra_workflow(config: Union[str, Path, dict],
                         f"sequential (n_workers=1)"
                     )
                     n_fm_workers = 1
+            loco_for_fm = _loco_for_finemapping(
+                loco_for_fm, pheno_dir / "loco_predictions.npz",
+                res3 if cfg["step3_global_lasso"]["run"] else None)
 
             tier = int(fm_cfg.get("tier", 1))
             fm_fn = ultrasusie if tier == 1 else ultramap

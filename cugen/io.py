@@ -76,6 +76,141 @@ _UNPACK_2BIT_KERNEL = None
 _FUSED_UNIVARIATE_KERNEL = None
 
 
+_UNPACK_NAN_KERNEL = None
+_UNPACK_RAW_KERNEL = None
+
+
+def _get_unpack_nan_kernel():
+    """Unpack to float32 with the missing code 3 -> NaN instead of 0.0.
+
+    The default kernel maps missing to 0.0, which is indistinguishable from
+    hom-ref. That is deliberate and correct for the LASSO path (a centred 0
+    contributes nothing once mu_x is subtracted), but it silently corrupts any
+    statistic that counts genotype classes: KING kinship reads a missing call
+    as hom-ref, which inflates IBS0 and deflates het. The step-4 streaming
+    kernel avoids this by skipping geno == 3 (``fused_univariate``, complete
+    case) together with the stored non-missing sxx; this kernel gives the
+    random-access readers the same choice.
+    """
+    global _UNPACK_NAN_KERNEL
+    if _UNPACK_NAN_KERNEL is None and HAS_CUPY:
+        _UNPACK_NAN_KERNEL = cp.RawKernel(r'''
+        extern "C" __global__
+        void unpack_2bit_to_float32_nan(
+            const unsigned char* packed,
+            float* output,
+            const long long n_samples,
+            const long long n_variants,
+            const long long bytes_per_variant
+        ) {
+            long long sample_idx = blockDim.x * blockIdx.x + threadIdx.x;
+            if (sample_idx >= n_samples) return;
+            long long byte_idx = sample_idx / 4;
+            int bit_shift = 6 - 2 * (sample_idx % 4);
+            for (long long var_idx = 0; var_idx < n_variants; var_idx++) {
+                long long packed_offset = var_idx * bytes_per_variant + byte_idx;
+                unsigned char byte_val = packed[packed_offset];
+                unsigned char geno = (byte_val >> bit_shift) & 0x03;
+                output[sample_idx * n_variants + var_idx] =
+                    (geno == 3) ? nanf("") : (float)geno;
+            }
+        }
+        ''', 'unpack_2bit_to_float32_nan')
+    return _UNPACK_NAN_KERNEL
+
+
+def _get_unpack_raw_kernel():
+    """Unpack to uint8 codes 0/1/2/3 with no dosage mapping at all.
+
+    Strictly more informative than the NaN variant (missing stays
+    distinguishable without spending 4 bytes per call), and what
+    genotype-class counters (KING kinship, concordance, IBS) need.
+    """
+    global _UNPACK_RAW_KERNEL
+    if _UNPACK_RAW_KERNEL is None and HAS_CUPY:
+        _UNPACK_RAW_KERNEL = cp.RawKernel(r'''
+        extern "C" __global__
+        void unpack_2bit_to_raw(
+            const unsigned char* packed,
+            unsigned char* output,
+            const long long n_samples,
+            const long long n_variants,
+            const long long bytes_per_variant
+        ) {
+            long long sample_idx = blockDim.x * blockIdx.x + threadIdx.x;
+            if (sample_idx >= n_samples) return;
+            long long byte_idx = sample_idx / 4;
+            int bit_shift = 6 - 2 * (sample_idx % 4);
+            for (long long var_idx = 0; var_idx < n_variants; var_idx++) {
+                long long packed_offset = var_idx * bytes_per_variant + byte_idx;
+                unsigned char byte_val = packed[packed_offset];
+                output[sample_idx * n_variants + var_idx] =
+                    (byte_val >> bit_shift) & 0x03;
+            }
+        }
+        ''', 'unpack_2bit_to_raw')
+    return _UNPACK_RAW_KERNEL
+
+
+_HAS_PREADV = hasattr(os, "preadv")
+
+
+def _pread_full(fd, mv, offset, path=None):
+    """Fill memoryview `mv` from `fd` at `offset`, looping on short reads.
+
+    ``os.preadv`` where available (Linux/BSD), else ``os.pread``. A read that
+    returns 0 bytes before `mv` is full (end of file) raises IOError.
+    """
+    n = mv.nbytes
+    got = 0
+    while got < n:
+        if _HAS_PREADV:
+            k = os.preadv(fd, [mv[got:]], offset + got)
+        else:  # pragma: no cover - platforms without preadv
+            b = os.pread(fd, n - got, offset + got)
+            k = len(b)
+            mv[got:got + k] = b
+        if k <= 0:
+            where = f"{path}: " if path else ""
+            raise IOError(f"{where}short read: got {got} of {n} bytes at offset {offset}")
+        got += k
+
+
+def _pread_rows(fd, base, bytes_per_row, rows, max_gap=0, path=None):
+    """Rows `rows` of a row-major byte matrix stored at byte offset `base` of `fd`.
+
+    Returns a ``(len(rows), bytes_per_row)`` uint8 array in the order of `rows`,
+    which must be sorted ascending (duplicates allowed). Rows are read with
+    positioned reads into an owned buffer, not through a memory map: mmap
+    page-faults 4 KB at a time with no readahead, which on network filesystems
+    is catastrophically slow for large gathers, and mapped pages also show up as
+    process RSS.
+
+    Runs of rows are coalesced into one read: exactly contiguous rows with the
+    default ``max_gap=0``; with ``max_gap=k`` rows separated by at most k
+    unwanted rows are read together and the wanted ones gathered from the run.
+    The returned bytes do not depend on `max_gap`.
+
+    Shared by :meth:`CugenReader._gather_packed` (cugen files) and the CPU/GPU
+    block readers in :mod:`cugen.genotypes` (cugen and PLINK .bed files).
+    """
+    rows = np.asarray(rows, dtype=np.int64)
+    bpr = int(bytes_per_row)
+    out = np.empty((len(rows), bpr), dtype=np.uint8)
+    if len(rows) == 0:
+        return out
+    br = np.flatnonzero(np.diff(rows) - 1 > max_gap) + 1
+    for s, e in zip(np.r_[0, br], np.r_[br, len(rows)]):
+        s, e = int(s), int(e)
+        r0, r1 = int(rows[s]), int(rows[e - 1]) + 1
+        exact = (r1 - r0) == (e - s)
+        buf = out[s:e] if exact else np.empty((r1 - r0, bpr), dtype=np.uint8)
+        _pread_full(fd, memoryview(buf).cast("B"), int(base) + r0 * bpr, path)
+        if not exact:
+            out[s:e] = buf[rows[s:e] - r0]
+    return out
+
+
 def _get_unpack_kernel():
     global _UNPACK_2BIT_KERNEL
     if _UNPACK_2BIT_KERNEL is None and HAS_CUPY:
@@ -314,11 +449,64 @@ class CugenReader:
         h = self.read_haplotypes(start, end)
         return (h[0::2, :] + h[1::2, :]).astype(np.float32)
 
+    def _gather_packed(self, sorted_indices: np.ndarray) -> np.ndarray:
+        """Packed records for `sorted_indices` as one flat host buffer.
+
+        Contiguous runs are coalesced into a single positioned read
+        (:func:`_pread_rows` with ``max_gap=0``). Only the wanted records are
+        read: the cugen is variant-major with a fixed ``bytes_per_variant``, so
+        a 4 % variant subset is 4 % of the bytes, not a full-file scan.
+        """
+        return _pread_rows(self._file.fileno(), int(self.data_offset),
+                           int(self.bytes_per_variant), sorted_indices,
+                           max_gap=0, path=self.path).reshape(-1)
+
+    def read_indices_raw_to_gpu(self, indices: Union[list, np.ndarray]) -> 'cp.ndarray':
+        """Random-access read of `indices` as RAW uint8 codes 0/1/2/3.
+
+        Returns ``(n_samples, len(indices))`` in the order of `indices`.
+        Missing (code 3) is preserved rather than mapped to 0.0, so
+        genotype-class counters stay correct; see :func:`_get_unpack_raw_kernel`.
+        Refuses phased (hap2bit) files, where the codes mean different things.
+        """
+        self._require_unphased("read_indices_raw_to_gpu")
+        if not HAS_CUPY:
+            raise RuntimeError("CuPy not available")
+        indices = np.asarray(indices, dtype=np.int64)
+        k = len(indices)
+        if k == 0:
+            return cp.empty((self.n_samples, 0), dtype=cp.uint8)
+        order = np.argsort(indices)
+        buf = self._gather_packed(indices[order])
+        cp.cuda.Device(self.device).use()
+        packed = cp.asarray(buf)
+        out_sorted = cp.empty((self.n_samples, k), dtype=cp.uint8)
+        tpb = 256
+        _get_unpack_raw_kernel()(((self.n_samples + tpb - 1) // tpb,), (tpb,),
+                                 (packed, out_sorted, np.int64(self.n_samples),
+                                  np.int64(k), np.int64(self.bytes_per_variant)))
+        del packed
+        out = out_sorted[:, cp.asarray(np.argsort(order))]
+        del out_sorted
+        cp.get_default_memory_pool().free_all_blocks()
+        return out
+
     def read_indices_to_gpu(self, indices: Union[list, np.ndarray],
-                            stream: Optional['cp.cuda.Stream'] = None) -> 'cp.ndarray':
+                            stream: Optional['cp.cuda.Stream'] = None,
+                            missing: str = "zero") -> 'cp.ndarray':
+        """Random-access read of `indices` as float32 ``(n_samples, len(indices))``.
+
+        `missing` selects the policy for the 2-bit missing code 3: ``"zero"``
+        (default, unchanged) maps it to 0.0, which is correct for the LASSO
+        path and wrong for anything that counts genotype classes; ``"nan"``
+        preserves it as NaN. For raw 0/1/2/3 codes use
+        :meth:`read_indices_raw_to_gpu`.
+        """
         self._require_unphased("read_indices_to_gpu")
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available")
+        if missing not in ("zero", "nan"):
+            raise ValueError(f"missing must be 'zero' or 'nan', got {missing!r}")
         indices = np.asarray(indices, dtype=np.int64)
         n_variants = len(indices)
         if n_variants == 0:
@@ -328,18 +516,12 @@ class CugenReader:
         sorted_indices = indices[sort_order]
         cp.cuda.Device(self.device).use()
 
-        packed_buffer = np.empty(n_variants * self.bytes_per_variant, dtype=np.uint8)
-        for i, var_idx in enumerate(sorted_indices):
-            byte_offset = self.data_offset + var_idx * self.bytes_per_variant
-            self._mmap.seek(byte_offset)
-            s = i * self.bytes_per_variant
-            packed_buffer[s:s + self.bytes_per_variant] = np.frombuffer(
-                self._mmap.read(self.bytes_per_variant), dtype=np.uint8
-            )
+        packed_buffer = self._gather_packed(sorted_indices)
 
         packed_gpu = cp.asarray(packed_buffer)
         X_sorted = cp.empty((self.n_samples, n_variants), dtype=cp.float32)
-        kernel = _get_unpack_kernel()
+        kernel = (_get_unpack_kernel() if missing == "zero"
+                  else _get_unpack_nan_kernel())
         threads_per_block = 256
         blocks = (self.n_samples + threads_per_block - 1) // threads_per_block
         kernel((blocks,), (threads_per_block,), (
@@ -359,14 +541,19 @@ class CugenReader:
         return X_gpu
 
     def read_indices_to_gpu_batched(self, indices: Union[list, np.ndarray],
-                                    stream: Optional['cp.cuda.Stream'] = None) -> 'cp.ndarray':
-        """Like read_indices_to_gpu but coalesces contiguous index runs into single mmap reads.
+                                    stream: Optional['cp.cuda.Stream'] = None,
+                                    missing: str = "zero") -> 'cp.ndarray':
+        """Like read_indices_to_gpu; contiguous index runs are read in one call.
 
-        Reduces syscall count 10-100× when adjacent indices survive top-K selection.
+        Reduces syscall count 10-100x when adjacent indices survive top-K
+        selection. `missing` is as on :meth:`read_indices_to_gpu`. Both methods
+        now share the run-coalescing reader (:meth:`_gather_packed`).
         """
         self._require_unphased("read_indices_to_gpu_batched")
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available")
+        if missing not in ("zero", "nan"):
+            raise ValueError(f"missing must be 'zero' or 'nan', got {missing!r}")
         indices = np.asarray(indices, dtype=np.int64)
         n_variants = len(indices)
         if n_variants == 0:
@@ -377,27 +564,12 @@ class CugenReader:
         cp.cuda.Device(self.device).use()
 
         bpv = self.bytes_per_variant
-        packed_buffer = np.empty(n_variants * bpv, dtype=np.uint8)
-
-        diffs = np.diff(sorted_indices)
-        run_breaks = np.where(diffs != 1)[0]
-        run_start_pos = np.concatenate([[0], run_breaks + 1])
-        run_end_pos = np.concatenate([run_breaks, [n_variants - 1]])
-
-        for rs, re_ in zip(run_start_pos, run_end_pos):
-            run_len = int(re_) - int(rs) + 1
-            first_var_idx = int(sorted_indices[rs])
-            byte_offset = self.data_offset + first_var_idx * bpv
-            run_nbytes = run_len * bpv
-            self._mmap.seek(byte_offset)
-            buf_s = int(rs) * bpv
-            packed_buffer[buf_s:buf_s + run_nbytes] = np.frombuffer(
-                self._mmap.read(run_nbytes), dtype=np.uint8
-            )
+        packed_buffer = self._gather_packed(sorted_indices)
 
         packed_gpu = cp.asarray(packed_buffer)
         X_sorted = cp.empty((self.n_samples, n_variants), dtype=cp.float32)
-        kernel = _get_unpack_kernel()
+        kernel = (_get_unpack_kernel() if missing == "zero"
+                  else _get_unpack_nan_kernel())
         threads_per_block = 256
         blocks = (self.n_samples + threads_per_block - 1) // threads_per_block
         kernel((blocks,), (threads_per_block,), (
