@@ -310,7 +310,13 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
                 "backend='gpu' was requested but CuPy is not importable. "
                 "Refusing to fall back to the CPU reference silently -- pass "
                 "backend='numpy' if that is what you want.")
-        use_gpu = (backend == "gpu") or (backend == "auto" and HAS_CUPY)
+        if backend == "auto" and HAS_CUPY:
+            # importable is not usable: a CPU node with cupy installed has no device
+            from ._device import is_available as _cuda_usable
+            auto_gpu = _cuda_usable()
+        else:
+            auto_gpu = False
+        use_gpu = (backend == "gpu") or (backend == "auto" and auto_gpu)
         engine = impute_haplotypes_gpu if use_gpu else impute_haplotypes_cpu
         path = "gpu (fused kernels)" if use_gpu else "numpy reference (CPU)"
         if verbose:

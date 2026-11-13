@@ -35,6 +35,12 @@ except ImportError:
     HAS_CUPY = False
     cp = None
 
+
+def _cuda_available():
+    """True only when CUDA is usable (cupy imports AND a device answers); see cugen.cuda."""
+    from ._device import is_available
+    return is_available()
+
 CUGEN_MAGIC = b"CUPGEN01"
 CUGEN_VERSION = 1
 HEADER_SIZE = 256
@@ -161,7 +167,9 @@ class CugenReader:
         self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
         self._load_stats()
 
-        if HAS_CUPY:
+        # Header, stats and packed-byte reads also work on a CPU node that has cupy
+        # installed; only select a CUDA device when one is actually usable.
+        if HAS_CUPY and _cuda_available():
             cp.cuda.Device(device).use()
 
     def _parse_header(self, header: bytes):

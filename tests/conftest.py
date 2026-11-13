@@ -8,13 +8,26 @@ import pytest
 
 from cugen.write import write_cugen
 
-try:
-    import cupy  # noqa: F401
-    _HAS_CUPY = True
-except ImportError:
-    _HAS_CUPY = False
+from cugen import cuda as _cuda
 
-requires_gpu = pytest.mark.skipif(not _HAS_CUPY, reason="CuPy not available")
+# GPU tests need a USABLE device, not just an importable cupy: on a CPU node with
+# cupy installed `import cupy` succeeds and every CUDA call then fails, so an
+# import probe turned skips into failures there. cugen.cuda.is_available()
+# imports cupy, counts devices and runs a 1-element op (cached).
+_HAS_CUPY = _cuda.is_available()
+_NO_GPU_REASON = "CUDA not available: %s" % (_cuda.unavailable_reason(),)
+
+requires_gpu = pytest.mark.skipif(not _HAS_CUPY, reason=_NO_GPU_REASON)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip (not fail) every ``@pytest.mark.gpu`` test when CUDA is not usable."""
+    if _HAS_CUPY:
+        return
+    skip = pytest.mark.skip(reason=_NO_GPU_REASON)
+    for item in items:
+        if "gpu" in item.keywords:
+            item.add_marker(skip)
 
 try:
     import cudf  # noqa: F401

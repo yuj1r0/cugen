@@ -35,7 +35,14 @@ __version__ = "0.1.7"
 
 
 def check_gpu():
-    """Return dict with GPU availability + memory info, or {'available': False}."""
+    """Return dict with GPU availability + memory info, or {'available': False}.
+
+    Built on :mod:`cugen.cuda`: available means cupy imports, a device exists and a
+    1-element op runs (``cugen.cuda.is_available()``), so a CPU node with cupy
+    installed reports ``available: False`` instead of failing later."""
+    from . import _device as _dev
+    if not _dev.is_available():
+        return {"available": False, "error": str(_dev.unavailable_reason())}
     try:
         import cupy as cp
         dev = cp.cuda.Device()
@@ -51,12 +58,26 @@ def check_gpu():
         return {"available": False, "error": str(e)}
 
 
-def set_device(device_id: int):
-    """Select CUDA device for subsequent CuPy ops."""
-    import cupy as cp
-    cp.cuda.Device(device_id).use()
-    return device_id
+def set_device(device_id):
+    """Select the CUDA device for subsequent CuPy ops.
 
+    Accepts an int (CUDA index; returned unchanged, as before) or any device spec
+    understood by :func:`cugen.device` (``"auto"``, ``"cpu"``, ``"cuda:N"``, a
+    ``Device``), in which case the resolved ``Device`` is returned. ``"cpu"`` is a
+    no-op."""
+    from ._device import Device, device as _resolve
+    dev = _resolve(device_id)
+    if dev.type == "cuda":
+        import cupy as cp
+        cp.cuda.Device(dev.index).use()
+    if isinstance(device_id, int) and not isinstance(device_id, bool):
+        return device_id
+    return dev if not isinstance(device_id, Device) else device_id
+
+
+# --- device API (PyTorch-style): cg.cuda.is_available(), cg.device("auto"|"cpu"|"cuda:N") ---
+from . import cuda  # noqa: E402,F401
+from ._device import CugenResourceError, Device, device  # noqa: E402,F401
 
 # --- canonical API ---
 from .io import CugenReader, is_phased, read_cugen, read_cugen_header
@@ -122,6 +143,11 @@ __all__ = [
     # diagnostics
     "check_gpu",
     "set_device",
+    # device API (PyTorch-style)
+    "cuda",
+    "device",
+    "Device",
+    "CugenResourceError",
     # canonical
     "CugenReader",
     "read_cugen",
