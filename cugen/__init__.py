@@ -202,6 +202,8 @@ __all__ = [
     "fit_cugenie_k",
     "fit_ultraloco",
     "ultraloco_gwas",
+    # demo and published datasets (imported lazily)
+    "datasets",
     # PLINK aliases
     "keep",
     "extract",
@@ -227,3 +229,13 @@ from .write import (CugenWriter, write_cugen, write_cugen_phased,  # noqa: E402,
                     validate_cugen)
 from .convert import (pgen2cugen, vcf2cugen, vcf2cugenh,      # noqa: E402,F401
                       bed2cugen)
+
+
+# --- datasets (imported lazily on first attribute access: ``cg.datasets``) --------------------
+def __getattr__(name):
+    if name == "datasets":
+        import importlib
+        mod = importlib.import_module(".datasets", __name__)
+        globals()["datasets"] = mod
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

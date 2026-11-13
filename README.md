@@ -243,6 +243,71 @@ loco.save("out/loco_predictions.npz"); ss.to_feather("out/height.sumstats.feathe
   on CPU).
 * The UltraLasso steps 1–3 and the pool step 4 (`cg.gwas`) need CUDA.
 
+## Demo data (`cugen.datasets`)
+
+`cugen.datasets` ships code, not data: a generator for a fully synthetic GWAS cohort, evaluators that
+score results against its known truth, and a checksum-verified `fetch()` for published datasets.
+Everything is CPU-only (numpy and the standard library).
+
+### Synthetic "exaggerated height"
+
+```bash
+python -m cugen.datasets.simulate_height --out demo_height --preset n3k  --n-workers 8   # n = 3,000, ~1 GB
+python -m cugen.datasets.simulate_height --out demo_height --preset n20k --n-workers 8   # n = 20,000, ~12 GB, ~7 min
+cd demo_height && python -c "import cugen as cg; cg.ultra_workflow('config_ultralasso.json')"
+python -m cugen.datasets.evaluate results/ultralasso/height/sumstats.tsv.gz .
+```
+
+```python
+from cugen.datasets import simulate_height, workflow_config, evaluate_gwas, background_r2
+meta = simulate_height("demo_height", preset="n3k", n_workers=8)    # keyword arguments override the preset
+cfg = workflow_config("demo_height", "results/std")                   # package defaults
+```
+
+LD comes from a haplotype-mosaic model (founder haplotypes per LD block, Markov switching inside a
+block); `n_pops`/`fst` add Balding-Nichols structure and `strat_shift` a population mean shift;
+`n_chrom` above 22 uses equal-length chromosomes (`chrom_lengths="equal"`). Outputs: per-chromosome
+`.cugen`, PLINK `.bed/.bim/.fam` (A1 = ALT, the counted allele), `pheno.tsv`, `covar.tsv`,
+`truth.tsv`, `annotation.feather`, `ld_blocks.tsv`, a held-out `test/` cohort, a ready
+`config_ultralasso.json` and `meta.json`. The run is deterministic for a seed whatever `n_workers`;
+because numpy does not promise identical random streams across versions, `meta.json` records the
+numpy version and a sha256 per file, and `cugen.datasets.verify("demo_height", "demo_height_n20k")`
+reports any file that differs.
+
+On `n20k` with the package defaults, UltraLasso found 259 loci against REGENIE v2.2.4's 155, with
+genomic control over causal-free LD blocks of 1.003 vs 1.002 and no false loci; 150 of REGENIE's
+155 loci lie within 250 kb of an UltraLasso locus. Read that with three qualifications: the two
+association statistics correlate at r(z) = 0.77 rather than ~1, because the LOCO backgrounds differ
+in strength (in-sample R² 0.51 vs 0.16); at this sample size the default LOCO offset attenuates
+causal effects by 7-8 %; and this is one synthetic architecture, not a benchmark across traits.
+`evaluate_finemapping` scores UltraSuSiE credible sets against the truth. For small cohorts the
+config uses one step-4 worker (`gpu.n_workers_gwas = 1`); scripts that use more need an
+`if __name__ == "__main__":` guard.
+
+### Published datasets
+
+```python
+from cugen import datasets
+datasets.list_datasets()                       # demo_height_n20k, demo_height_n3k, darwins_ark_2022, darwins_ark_2025
+datasets.info("darwins_ark_2022")              # files, sizes, sha256, licence, citation
+path = datasets.fetch("darwins_ark_2022", parts=["genotypes"])
+datasets.verify(path, "darwins_ark_2022")
+```
+
+Downloads resume (HTTP `Range`), are checked against the manifest's size and sha256, and land in
+`dest=`, else `$CUGEN_DATA`, else `~/.cache/cugen/datasets`; point it at a large filesystem.
+Archives are extracted member by member with path checks, and nothing in them is executed.
+
+| name | contents | size | access |
+|---|---|---|---|
+| `demo_height_n20k` / `demo_height_n3k` | the synthetic cohorts above | ~12 GB / ~1 GB | not published yet: `fetch` raises `DatasetNotHostedError` with the regenerate command |
+| `darwins_ark_2022` | Darwin's Ark genotypes and phenotypes (Morrill et al., *Science* 2022), Zenodo mirror 6522639 of Dryad doi:10.5061/dryad.g4f4qrfr0, CC0 | 7.0 GB | open |
+| `darwins_ark_2025` | Darwin's Dogs data (Lord et al., *PNAS* 2025), Dryad doi:10.5061/dryad.83bk3jb4r, CC0 | 19.5 GB | manual: Dryad needs a login; download by hand, then `verify()` |
+
+`fetch` stops at verified raw archives: deriving a phenotype and converting the genotypes are up to
+the user. Note the allele conventions when you convert: `cugen.BedGenotypes` counts the bim A1
+allele (as PLINK and REGENIE do), while `cugen.bed2cugen` counts A2 by default (`counted="A1"` to match).
+
 ## The `.cugen` file format
 
 A single fixed-layout binary supporting both streaming and random
