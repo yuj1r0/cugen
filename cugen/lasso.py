@@ -828,6 +828,16 @@ def fit_joint_lasso(
             logger.info(f"Saved full model to {full_model_path}")
 
     # ---- LOCO ----
+    # Release the FISTA / joint-LASSO temporaries cached in the CuPy pool before
+    # the LOCO refits. Each refit allocates a fresh float64 Gram on top of X_gpu,
+    # and with large active sets at large n the margin is thin: freeing cached
+    # blocks here recovers the headroom without touching the model. Same pattern
+    # the workflow uses before step 4.
+    try:
+        import cupy as _cp
+        _cp.get_default_memory_pool().free_all_blocks()
+    except Exception:  # noqa: BLE001
+        pass
     t_loco = time.time()
     if mode == "masked":
         loco_predictions = loco_masked_predictions(

@@ -37,6 +37,11 @@ except ImportError:
     cp = None
 
 
+def _cuda_usable():
+    from .._device import is_available
+    return is_available()
+
+
 _CHR_COLORS = ["#1f4d80", "#80c1ff"]
 
 
@@ -112,7 +117,7 @@ def _manhattan_single(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if HAS_CUPY and use_gpu:
+    if use_gpu and HAS_CUPY and _cuda_usable():
         cp.cuda.Device(device).use()
         xp = cp
     else:

@@ -31,11 +31,12 @@ from typing import Dict
 
 try:
     import cupy as cp
+    from cupyx.scipy.special import erf as _gpu_erf, erfc as _gpu_erfc
     HAS_CUPY = True
 except ImportError:                                            # noqa: BLE001
     cp = None
+    _gpu_erf = _gpu_erfc = None
     HAS_CUPY = False
-from cupyx.scipy.special import erf as _gpu_erf, erfc as _gpu_erfc
 
 
 EPS32 = 1e-12

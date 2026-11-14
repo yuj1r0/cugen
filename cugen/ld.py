@@ -150,6 +150,14 @@ except ImportError:                                            # noqa: BLE001
     cp = None
     HAS_CUPY = False
 
+
+def _cuda_ok():
+    """backend="auto" resolves to the GPU only when CUDA is usable, not merely importable."""
+    if not HAS_CUPY:
+        return False
+    from ._device import is_available
+    return is_available()
+
 # Optional. When present, results never leave the device before being written:
 # cudf.Series wraps a CuPy array through __cuda_array_interface__, so building
 # the frame is pointer bookkeeping rather than a copy. Measured at 5.2M rows,
@@ -246,7 +254,7 @@ def _resolve_precision(precision, n_samples, verbose):
         raise ValueError(
             "precision must be 'auto', 'tf32' or 'fp32'; got {!r}".format(
                 precision))
-    if precision == "fp32" or not HAS_CUPY:
+    if precision == "fp32" or not _cuda_ok():
         return False
     cc = cp.cuda.Device().compute_capability
     cc_num = int(cc) if isinstance(cc, str) else cc[0] * 10 + cc[1]
@@ -1764,7 +1772,7 @@ def ld_clump(
     rank[order] = np.arange(len(rel), dtype=np.int32)
     cand = pv <= p1
 
-    want_gpu = backend == "gpu" or (backend == "auto" and HAS_CUPY)
+    want_gpu = backend == "gpu" or (backend == "auto" and _cuda_ok())
     reader = read_cugen(str(cugen))
     if backend == "gpu" and not HAS_CUPY:
         raise RuntimeError("backend='gpu' but CuPy is not available")
@@ -2799,13 +2807,14 @@ def ld_matrix(
     if region is not None and variant_range is not None:
         raise ValueError("pass at most one of region= and variant_range=")
 
-    use_gpu = HAS_CUPY if backend == "auto" else (backend == "gpu")
+    use_gpu = _cuda_ok() if backend == "auto" else (backend == "gpu")
     if backend == "gpu" and not HAS_CUPY:
         raise RuntimeError("CuPy not available")
-    if backend == "auto" and not HAS_CUPY:
+    if backend == "auto" and not use_gpu:
+        from ._device import unavailable_reason
         raise RuntimeError(
-            "CuPy not available. Pass backend='numpy' for the CPU reference "
-            "path (correct but not fast).")
+            f"CUDA not available ({unavailable_reason()}). Pass backend='numpy' "
+            "for the CPU reference path (correct but not fast).")
 
     reader = read_cugen(path, device=device)
     want_phased = [s for s in stats if s in _PHASED_STATS]

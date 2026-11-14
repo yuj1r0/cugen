@@ -97,6 +97,56 @@ def _compute_lambda_gc(p_values: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Sumstats writer: exact integer columns
+# ---------------------------------------------------------------------------
+
+# Integer-valued columns. After the left-join on gidx, an annotation with a
+# missing value for any variant upcasts the whole column to float64, and
+# ``float_format='%.6g'`` then ROUNDS it to 6 significant digits
+# (POS 16057417 -> "1.60574e+07", off by up to +-500 bp). They are cast to
+# nullable Int64 before writing, so they are always exact integers (empty when
+# missing). The float statistics keep the '%.6g' format.
+_SUMSTATS_INT_COLS = ('CHR', 'POS', 'gidx')
+
+
+def _exact_int_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast integer-valued float columns in ``_SUMSTATS_INT_COLS`` to Int64."""
+    for c in _SUMSTATS_INT_COLS:
+        if c not in df.columns or not pd.api.types.is_float_dtype(df[c]):
+            continue
+        v = df[c].to_numpy(dtype=np.float64)
+        fin = np.isfinite(v)
+        if np.array_equal(v[fin], np.round(v[fin])):
+            df[c] = pd.array(np.where(fin, v, 0).astype(np.int64), dtype='Int64')
+            if not fin.all():
+                df.loc[~fin, c] = pd.NA
+        else:  # not integer-valued: leave the values, but never round them
+            logger.warning("column %s has non-integer values; written unrounded", c)
+            df[c] = df[c].map(lambda x: '' if not np.isfinite(x) else repr(float(x)))
+    return df
+
+
+def _write_sumstats(gwas_df: pd.DataFrame, out_path: str) -> None:
+    """Per-chromosome sumstats TSV: exact integer columns, '%.6g' statistics."""
+    _exact_int_columns(gwas_df).to_csv(out_path, sep='\t', index=False,
+                                       float_format='%.6g')
+
+
+def _mac_case_minor(mac_case: np.ndarray, n_case: float) -> np.ndarray:
+    """Case count of the MINOR allele from the coded-allele case count.
+
+    ``MAC_CASE = X'y`` counts the CODED (ALT) allele among cases; where ALT is
+    the major allele it is ~2*n_case, so a ``MAC_CASE >= 20`` gate passes
+    variants with no minor-allele case carriers. ``min(MAC_CASE,
+    2*n_case - MAC_CASE)`` orients it to the minor allele. Exact when cases have
+    no missing calls; with missing calls (coded 0) it can only over-count the
+    minor allele when ALT is major, i.e. it errs toward keeping a variant.
+    """
+    mac_case = np.asarray(mac_case, dtype=np.float64)
+    return np.minimum(mac_case, 2.0 * float(n_case) - mac_case)
+
+
+# ---------------------------------------------------------------------------
 # Worker — process assigned chromosomes in its own CUDA context
 # ---------------------------------------------------------------------------
 
@@ -244,7 +294,7 @@ def _worker_gwas(args_tuple):
         # behaviour; the merge step pipes them together with awk/pigz).
         if output_dir is not None:
             out_path = os.path.join(output_dir, f"chr{chr_num}_sumstats.tsv")
-            gwas_df.to_csv(out_path, sep='\t', index=False, float_format='%.6g')
+            _write_sumstats(gwas_df, out_path)
 
         n_sig = int((gwas_df['P'] < 5e-8).sum())
         elapsed = time.time() - t_chr
@@ -354,6 +404,9 @@ def _worker_gwas_binary(args_tuple):
     worker_results = {}
     t_worker_start = time.time()
 
+    # Number of cases, for MAC_CASE_MINOR (see _mac_case_minor).
+    n_case = float(np.nansum(y))
+
     y_gpu = cp.asarray(y, dtype=cp.float32)
 
     for chr_num in sorted(chromosomes):
@@ -422,6 +475,9 @@ def _worker_gwas_binary(args_tuple):
                 _caseAC[_s:_e] = X_gpu[:, _s:_e].astype(cp.float64).T @ _yb
             mac_case_np = cp.asnumpy(_caseAC)
             mac_ctrl_np = mac_block.astype(np.float64) - mac_case_np
+            # MAC_CASE counts the CODED allele; MAC_CASE_MINOR is the minor-allele
+            # case count, the one a case-carrier gate must use.
+            mac_case_minor_np = _mac_case_minor(mac_case_np, n_case)
             # gpt Rec 2: LOG10P stored natively (true -log10 P; beyond float64
             # underflow it equals the 1e-300 clip — none of these traits reach it).
             log10p_np = -np.log10(np.clip(p_final_np, 1e-300, 1.0))
@@ -439,6 +495,7 @@ def _worker_gwas_binary(args_tuple):
                 'MAC': mac_block,
                 'MAC_CASE': mac_case_np,
                 'MAC_CTRL': mac_ctrl_np,
+                'MAC_CASE_MINOR': mac_case_minor_np,
             }))
 
             del X_gpu, score_stats, p_final_gpu, valid_mask_gpu, spa_mask_gpu, _caseAC
@@ -457,13 +514,14 @@ def _worker_gwas_binary(args_tuple):
             gwas_df['ALT'] = '.'
 
         cols = ['CHR', 'POS', 'ID', 'REF', 'ALT', 'BETA', 'SE', 'Z', 'P',
-                'P_NORM', 'LOG10P', 'TEST', 'MAF', 'MAC', 'MAC_CASE', 'MAC_CTRL', 'gidx']
+                'P_NORM', 'LOG10P', 'TEST', 'MAF', 'MAC', 'MAC_CASE', 'MAC_CTRL',
+                'MAC_CASE_MINOR', 'gidx']
         out_cols = [c for c in cols if c in gwas_df.columns]
         gwas_df = gwas_df[out_cols]
 
         if output_dir is not None:
             out_path = os.path.join(output_dir, f"chr{chr_num}_sumstats.tsv")
-            gwas_df.to_csv(out_path, sep='\t', index=False, float_format='%.6g')
+            _write_sumstats(gwas_df, out_path)
 
         n_sig = int(np.nansum(gwas_df['P'].to_numpy() < 5e-8))
         logger.info(
@@ -598,7 +656,14 @@ def gwas(
     -------
     pandas.DataFrame
         Sumstats. Columns (production order):
-        CHR, POS, ID, REF, ALT, BETA, SE, Z, P, MAF, gidx.
+        CHR, POS, ID, REF, ALT, BETA, SE, Z, P, MAF, gidx. The binary path
+        writes CHR, POS, ID, REF, ALT, BETA, SE, Z, P, P_NORM, LOG10P, TEST,
+        MAF, MAC, MAC_CASE, MAC_CTRL, MAC_CASE_MINOR, gidx. MAC_CASE counts the
+        coded (ALT) allele among cases; MAC_CASE_MINOR = min(MAC_CASE,
+        2*n_case - MAC_CASE) is the minor-allele case count, which is what a
+        case-carrier filter should use (with missing calls among cases it can
+        only over-count, i.e. it errs toward keeping a variant). CHR, POS and
+        gidx are always written as exact integers.
     """
     # 'logistic' is an alias for the binary score+SPA path.
     if family == "logistic":

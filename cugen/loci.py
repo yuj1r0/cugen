@@ -27,6 +27,122 @@ import pandas as pd
 
 logger = logging.getLogger("cugen.loci")
 
+#: median of the chi-square distribution with 1 df (scipy.stats.chi2.ppf(0.5, 1))
+CHI2_MEDIAN = 0.454936423119572
+#: |z| at two-sided P = 5e-8 (scipy.stats.norm.isf(2.5e-8))
+ZGWS = 5.451310437845478
+
+
+def lambda_gc(z=None, p=None) -> float:
+    """Genomic-control lambda: median chi-square / its null median (``CHI2_MEDIAN``).
+
+    Pass Z statistics (``z=``, chi2 = z^2, no special functions) or P values (``p=``,
+    clipped to [1e-300, 1]). For P only the middle order statistic(s) are converted, since
+    ``chi2.isf`` is monotone, which avoids an ``isf`` over millions of values. Non-finite
+    entries are ignored; NaN when nothing is left.
+    """
+    if (z is None) == (p is None):
+        raise ValueError("pass exactly one of z= or p=")
+    if z is not None:
+        z = np.asarray(z, dtype=np.float64)
+        z = z[np.isfinite(z)]
+        return float(np.median(z * z) / CHI2_MEDIAN) if z.size else float("nan")
+    p = np.asarray(p, dtype=np.float64)
+    p = np.clip(p[np.isfinite(p)], 1e-300, 1.0)
+    m = p.size
+    if not m:
+        return float("nan")
+    from scipy.stats import chi2
+    k = (m - 1) // 2
+    part = np.partition(p, [k, m - 1 - k])
+    return float(0.5 * (chi2.isf(part[k], 1) + chi2.isf(part[m - 1 - k], 1)) / CHI2_MEDIAN)
+
+
+def log10p_from_z(z):
+    """-log10 two-sided P from Z, computed in log space (no underflow at large |z|)."""
+    from scipy.special import log_ndtr
+    z = np.abs(np.asarray(z, dtype=np.float64))
+    return -(np.log(2.0) + log_ndtr(-z)) / np.log(10.0)
+
+
+def _greedy_clump(chrom, pos, order, window):
+    """Greedy distance clumping core shared by :func:`define_loci` and :func:`distance_clumps`.
+
+    Variants are visited in ``order`` (priority, best first); a variant becomes a lead
+    unless an earlier lead on the same chromosome lies within +/- ``window`` (inclusive).
+    Returns (lead indices in visiting order, number of not-yet-claimed variants within
+    the window of each lead, itself included). Per chromosome the positions are sorted
+    once and each lead claims a searchsorted range, so the cost is O(G log G).
+    """
+    chrom = np.asarray(chrom)
+    pos = pd.to_numeric(pd.Series(np.asarray(pos, dtype=object) if np.asarray(pos).dtype == object
+                                  else np.asarray(pos)), errors="coerce").to_numpy(np.float64, na_value=np.nan)
+    order = np.asarray(order, dtype=np.int64)
+    G = len(pos)
+    rank = np.empty(G, dtype=np.int64)
+    rank[order] = np.arange(G)
+    lead = np.zeros(G, dtype=bool)
+    nsig = np.zeros(G, dtype=np.int64)
+    nopos = ~np.isfinite(pos)
+    lead[nopos] = True                  # no position: its own locus, claims nothing
+    nsig[nopos] = 1
+    for c in pd.unique(chrom):
+        idx = np.flatnonzero((chrom == c) & ~nopos)
+        if not len(idx):
+            continue
+        o = idx[np.argsort(pos[idx], kind="stable")]
+        ps = pos[o]
+        taken = np.zeros(len(o), dtype=bool)
+        for i in np.argsort(rank[o], kind="stable"):
+            if taken[i]:
+                continue
+            lo = np.searchsorted(ps, ps[i] - window, "left")
+            hi = np.searchsorted(ps, ps[i] + window, "right")
+            lead[o[i]] = True
+            nsig[o[i]] = (hi - lo) - int(taken[lo:hi].sum())
+            taken[lo:hi] = True
+    leads = order[lead[order]]
+    return leads, nsig[leads]
+
+
+def distance_clumps(chrom, pos, score, window=1_000_000):
+    """Greedy distance clumps: the best variant (largest ``score``), drop everything within
+    +/- ``window``, repeat, per chromosome. Returns a DataFrame CHR, POS, LOG10P (= score),
+    n_sig (variants claimed by the lead, itself included) and row (the lead's index in the
+    input arrays), sorted by score (descending)."""
+    chrom = np.asarray(chrom)
+    pos = np.asarray(pos)
+    score = np.asarray(score, dtype=np.float64)
+    leads, nsig = _greedy_clump(chrom, pos, np.argsort(-score, kind="stable"), window)
+    df = pd.DataFrame({"CHR": chrom[leads].astype(np.int64), "POS": pos[leads].astype(np.int64),
+                       "LOG10P": score[leads], "n_sig": nsig.astype(np.int64),
+                       "row": leads.astype(np.int64)})
+    return df.sort_values("LOG10P", ascending=False, kind="stable").reset_index(drop=True)
+
+
+def summarize(sumstats=None, *, z=None, chrom=None, pos=None, z_col="Z", window=1_000_000):
+    """Fast GWAS summary from Z alone (no ``chi2.isf`` over millions of P values).
+
+    Returns ``(info, clumps)``: ``info`` = dict(n_tests, lambda_gc, n_gws, n_loci,
+    n_chrom_with_gws, max_abs_z, max_log10p) with GWS = |z| > ``ZGWS`` (P < 5e-8), and
+    ``clumps`` = :func:`distance_clumps` over the GWS rows (``window`` bp, default 1 Mb;
+    ``row`` indexes the input rows).
+    Pass a sumstats DataFrame (CHR, POS and ``z_col``) or the arrays.
+    """
+    if sumstats is not None:
+        z = sumstats[z_col].to_numpy()
+        chrom = sumstats["CHR"].to_numpy()
+        pos = sumstats["POS"].to_numpy()
+    z = np.asarray(z, dtype=np.float64)
+    ok = np.isfinite(z)
+    g = ok & (np.abs(z) > ZGWS)
+    cl = distance_clumps(np.asarray(chrom)[g], np.asarray(pos)[g], log10p_from_z(z[g]), window)
+    cl["row"] = np.flatnonzero(g)[cl["row"].to_numpy()]          # index into the input rows
+    return {"n_tests": int(ok.sum()), "lambda_gc": lambda_gc(z=z[ok]), "n_gws": int(g.sum()),
+            "n_loci": int(len(cl)), "n_chrom_with_gws": int(cl.CHR.nunique()) if len(cl) else 0,
+            "max_abs_z": float(np.abs(z[ok]).max()) if ok.any() else float("nan"),
+            "max_log10p": float(log10p_from_z(np.abs(z[ok]).max())) if ok.any() else float("nan")}, cl
+
 
 def define_loci(
     sumstats,
@@ -125,25 +241,12 @@ def define_loci(
         return loci_df
 
     # ---- Step 2: greedy clumping -----------------------------------------
+    # Visit variants by P; a variant leads unless an earlier lead on its
+    # chromosome is within +/- clump_window (inclusive). Shared, vectorised core.
     sig = sig.sort_values("P").reset_index(drop=True)
-    lead_snps = []
-    used = set()
-
-    for _, row in sig.iterrows():
-        key = (row["CHR"], row["POS"])
-        if key in used:
-            continue
-
-        lead_snps.append(row)
-
-        # Mark all variants within +/- clump_window as used
-        mask = (
-            (sig["CHR"] == row["CHR"])
-            & (sig["POS"] >= row["POS"] - clump_window)
-            & (sig["POS"] <= row["POS"] + clump_window)
-        )
-        for _, r in sig[mask].iterrows():
-            used.add((r["CHR"], r["POS"]))
+    lead_idx, _ = _greedy_clump(sig["CHR"].to_numpy(), sig["POS"].to_numpy(),
+                                np.arange(len(sig)), clump_window)
+    lead_snps = [sig.iloc[i] for i in lead_idx]
 
     if verbose:
         logger.info(

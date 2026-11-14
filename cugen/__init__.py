@@ -1,4 +1,4 @@
-"""cugen — GPU-accelerated UltraLasso genomics API.
+"""cugen — UltraLasso genomics API: GPU at biobank scale, CPU or GPU for small cohorts.
 
 Canonical entry points::
 
@@ -29,13 +29,29 @@ UltraMAP are step 5b of the *one* UltraLasso pipeline, so they live under
     fm2    = ultralasso.map_(loci, ...)    # step 5b Tier 2 (UltraMAP)
 
 PLINK / Hail aliases are wired in too (cg.keep, cg.glm, cg.freq, …).
+
+Backgrounds on CPU or GPU (``cg.background``; numpy or cupy, ``device="auto"``)::
+
+    geno = cg.open_genotypes("cohort")                    # PLINK prefix or cugen directory
+    loco = cg.fit_cugenie(geno, y, covariates)            # or fit_cugenie_k / fit_ultraloco
+    ss   = cg.background.gwas_blocked(geno, loco)         # blocked linear step 4
+    info, loci = cg.summarize(ss)
+
+Devices follow PyTorch naming: ``cg.cuda.is_available()``, ``cg.device("auto")``.
 """
 
 __version__ = "0.1.7"
 
 
 def check_gpu():
-    """Return dict with GPU availability + memory info, or {'available': False}."""
+    """Return dict with GPU availability + memory info, or {'available': False}.
+
+    Built on :mod:`cugen.cuda`: available means cupy imports, a device exists and a
+    1-element op runs (``cugen.cuda.is_available()``), so a CPU node with cupy
+    installed reports ``available: False`` instead of failing later."""
+    from . import _device as _dev
+    if not _dev.is_available():
+        return {"available": False, "error": str(_dev.unavailable_reason())}
     try:
         import cupy as cp
         dev = cp.cuda.Device()
@@ -51,12 +67,26 @@ def check_gpu():
         return {"available": False, "error": str(e)}
 
 
-def set_device(device_id: int):
-    """Select CUDA device for subsequent CuPy ops."""
-    import cupy as cp
-    cp.cuda.Device(device_id).use()
-    return device_id
+def set_device(device_id):
+    """Select the CUDA device for subsequent CuPy ops.
 
+    Accepts an int (CUDA index; returned unchanged, as before) or any device spec
+    understood by :func:`cugen.device` (``"auto"``, ``"cpu"``, ``"cuda:N"``, a
+    ``Device``), in which case the resolved ``Device`` is returned. ``"cpu"`` is a
+    no-op."""
+    from ._device import Device, device as _resolve
+    dev = _resolve(device_id)
+    if dev.type == "cuda":
+        import cupy as cp
+        cp.cuda.Device(dev.index).use()
+    if isinstance(device_id, int) and not isinstance(device_id, bool):
+        return device_id
+    return dev if not isinstance(device_id, Device) else device_id
+
+
+# --- device API (PyTorch-style): cg.cuda.is_available(), cg.device("auto"|"cpu"|"cuda:N") ---
+from . import cuda  # noqa: E402,F401
+from ._device import CugenResourceError, Device, device  # noqa: E402,F401
 
 # --- canonical API ---
 from .io import CugenReader, is_phased, read_cugen, read_cugen_header
@@ -64,7 +94,7 @@ from .prep_cohort import prepare_cohort
 from .screen import screen_chromosome
 from .lasso import fit_joint_lasso
 from .assoc import gwas, ultralasso_gwas
-from .loci import define_loci
+from .loci import define_loci, lambda_gc, summarize
 from .workflow import ultra_workflow
 from .freq import frequency
 
@@ -114,6 +144,12 @@ from .aliases import (  # noqa: F401
 # because they are step 5b of the ONE UltraLasso pipeline.
 from . import ultralasso  # noqa: F401
 
+# --- LOCO backgrounds on CPU or GPU (CuGenie, CuGenie-K, UltraLOCO; UltraLasso peer) ---
+from .genotypes import BedGenotypes, CugenGenotypes, open_genotypes  # noqa: E402,F401
+from . import background  # noqa: E402,F401
+from .background import (LocoPredictions, fit_cugenie, fit_cugenie_k,  # noqa: E402,F401
+                         fit_ultraloco, ultraloco_gwas)
+
 # --- stub modules (v0.2 roadmap) ---
 from . import impute as _impute_mod  # noqa: F401
 from . import ld, plot, popstruct, qc, score, subset  # noqa: F401
@@ -122,6 +158,11 @@ __all__ = [
     # diagnostics
     "check_gpu",
     "set_device",
+    # device API (PyTorch-style)
+    "cuda",
+    "device",
+    "Device",
+    "CugenResourceError",
     # canonical
     "CugenReader",
     "read_cugen",
@@ -132,6 +173,8 @@ __all__ = [
     "gwas",
     "ultralasso_gwas",
     "define_loci",
+    "lambda_gc",
+    "summarize",
     "ultra_workflow",
     "frequency",
     # subsetting (v0.1.2)
@@ -149,6 +192,18 @@ __all__ = [
     "score",
     # method subpackage (sklearn-style; contains susie + map_ for step 5b)
     "ultralasso",
+    # LOCO backgrounds on CPU or GPU
+    "background",
+    "open_genotypes",
+    "BedGenotypes",
+    "CugenGenotypes",
+    "LocoPredictions",
+    "fit_cugenie",
+    "fit_cugenie_k",
+    "fit_ultraloco",
+    "ultraloco_gwas",
+    # demo and published datasets (imported lazily)
+    "datasets",
     # PLINK aliases
     "keep",
     "extract",
@@ -174,3 +229,13 @@ from .write import (CugenWriter, write_cugen, write_cugen_phased,  # noqa: E402,
                     validate_cugen)
 from .convert import (pgen2cugen, vcf2cugen, vcf2cugenh,      # noqa: E402,F401
                       bed2cugen)
+
+
+# --- datasets (imported lazily on first attribute access: ``cg.datasets``) --------------------
+def __getattr__(name):
+    if name == "datasets":
+        import importlib
+        mod = importlib.import_module(".datasets", __name__)
+        globals()["datasets"] = mod
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

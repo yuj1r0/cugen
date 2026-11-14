@@ -8,13 +8,26 @@ import pytest
 
 from cugen.write import write_cugen
 
-try:
-    import cupy  # noqa: F401
-    _HAS_CUPY = True
-except ImportError:
-    _HAS_CUPY = False
+from cugen import cuda as _cuda
 
-requires_gpu = pytest.mark.skipif(not _HAS_CUPY, reason="CuPy not available")
+# GPU tests need a USABLE device, not just an importable cupy: on a CPU node with
+# cupy installed `import cupy` succeeds and every CUDA call then fails, so an
+# import probe turned skips into failures there. cugen.cuda.is_available()
+# imports cupy, counts devices and runs a 1-element op (cached).
+_HAS_CUPY = _cuda.is_available()
+_NO_GPU_REASON = "CUDA not available: %s" % (_cuda.unavailable_reason(),)
+
+requires_gpu = pytest.mark.skipif(not _HAS_CUPY, reason=_NO_GPU_REASON)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip (not fail) every ``@pytest.mark.gpu`` test when CUDA is not usable."""
+    if _HAS_CUPY:
+        return
+    skip = pytest.mark.skip(reason=_NO_GPU_REASON)
+    for item in items:
+        if "gpu" in item.keywords:
+            item.add_marker(skip)
 
 try:
     import cudf  # noqa: F401
@@ -160,3 +173,81 @@ def phased_cugen(tmp_path, phased_panel):
     return str(ref_p), str(tgt_p), {"ann": ann, "typed": typed,
                                     "ref_hap": ref_hap, "tgt_hap": tgt_hap,
                                     "ne": scaled_ne(ref_hap.shape[0])}
+
+
+# ---------------------------------------------------------------------------
+# Small cohorts for cugen.genotypes / cugen.background: a polygenic phenotype on
+# three chromosomes, written as a PLINK .bed (counting A1) and as per-chromosome
+# cugens (counting A2, as bed2cugen does by default).
+# ---------------------------------------------------------------------------
+
+def simulate_cohort(n=300, m_per_chr=(60, 50, 40), h2=0.5, n_causal=20, miss=0.02, seed=0, ncov=2):
+    """Counts (variants, samples) with 3 = missing, chrom (variants,), y (n,), covariates (n, ncov)."""
+    rng = np.random.default_rng(seed)
+    chrom = np.concatenate([np.full(m, c + 1) for c, m in enumerate(m_per_chr)])
+    m = len(chrom)
+    p = rng.uniform(0.05, 0.5, m)
+    G = rng.binomial(2, p[:, None], size=(m, n)).astype(np.uint8)
+    G[rng.random((m, n)) < miss] = 3
+    X = np.where(G == 3, 0, G).astype(float)
+    X = (X - X.mean(1, keepdims=True)) / (X.std(1, keepdims=True) + 1e-9)
+    beta = np.zeros(m)
+    cs = rng.choice(m, n_causal, replace=False)
+    beta[cs] = rng.normal(0, 1, n_causal)
+    gv = beta @ X
+    gv = gv / gv.std() * np.sqrt(h2)
+    C = rng.normal(size=(n, ncov))
+    y = gv + C @ rng.normal(0, 0.3, ncov) + rng.normal(0, np.sqrt(1 - h2), n)
+    return G, chrom, y, C
+
+
+def write_bed(prefix, counts_vn, chrom, pos=None, ids=None, a1=None, a2=None, fam_ids=None):
+    """Counts of A1 (variants, samples), 3 = missing -> prefix.bed/.bim/.fam (PLINK 1, SNP-major)."""
+    from cugen._codec import BED_MAGIC, pack_bed
+    counts_vn = np.asarray(counts_vn)
+    m, n = counts_vn.shape
+    with open(prefix + ".bed", "wb") as fh:
+        fh.write(BED_MAGIC)
+        fh.write(pack_bed(counts_vn, counted="A1").tobytes())
+    pos = np.arange(1, m + 1) * 1000 if pos is None else pos
+    ids = [f"snp{i}" for i in range(m)] if ids is None else ids
+    a1 = ["A"] * m if a1 is None else a1
+    a2 = ["G"] * m if a2 is None else a2
+    with open(prefix + ".bim", "w") as fh:
+        for i in range(m):
+            fh.write(f"{chrom[i]}\t{ids[i]}\t0\t{pos[i]}\t{a1[i]}\t{a2[i]}\n")
+    fam_ids = [f"s{i}" for i in range(n)] if fam_ids is None else fam_ids
+    with open(prefix + ".fam", "w") as fh:
+        for s in fam_ids:
+            fh.write(f"{s} {s} 0 0 0 -9\n")
+    return prefix
+
+
+def write_counts_cugen(path, counts_vn, gidx=None):
+    """Counts (variants, samples), 3 = missing -> a 2-bit cugen at `path`."""
+    g = np.asarray(counts_vn, dtype=np.float64).T.copy()
+    g[g == 3] = np.nan
+    return write_cugen(str(path), g, gidx=gidx)
+
+
+def a2_counts(G):
+    """A1 counts -> A2 counts (missing stays 3)."""
+    return np.where(G == 3, 3, 2 - G).astype(np.uint8)
+
+
+def make_cohort_files(d, n=240, m_per_chr=(70, 55, 45), seed=3):
+    """Write the simulated cohort under directory `d`; returns a dict of arrays and readers."""
+    from cugen.genotypes import BedGenotypes, CugenGenotypes
+    d = str(d)
+    G, chrom, y, C = simulate_cohort(n=n, m_per_chr=m_per_chr, seed=seed)
+    write_bed(d + "/t", G, chrom)
+    for c in np.unique(chrom):
+        o = chrom == c
+        write_counts_cugen(f"{d}/chr{c}.cugen", a2_counts(G[o]), gidx=np.flatnonzero(o))
+    return dict(dir=d, G=G, chrom=chrom, y=y, C=C, bed=BedGenotypes(d + "/t"), cg=CugenGenotypes(d))
+
+
+@pytest.fixture(scope="module")
+def cohort(tmp_path_factory):
+    """Simulated cohort (n=240, 170 variants on 3 chromosomes) as .bed and cugens."""
+    return make_cohort_files(tmp_path_factory.mktemp("cohort"))

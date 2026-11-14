@@ -86,8 +86,10 @@ pip install cugen
 pip install "cugen[gpu,plot]"
 ```
 
-Requires Python ≥ 3.10, CUDA 12.x, and a recent NVIDIA GPU
-(80 GB device memory recommended at biobank scale).
+Requires Python ≥ 3.10. The biobank-scale UltraLasso pipeline needs CUDA 12.x and a recent
+NVIDIA GPU (80 GB device memory recommended). The background engines in `cg.background`
+(CuGenie, CuGenie-K, UltraLOCO) and the blocked step 4 also run on CPU with only numpy,
+scipy, pandas and pyarrow; see [Running on CPU](#running-on-cpu).
 
 ## Quickstart
 
@@ -150,6 +152,162 @@ cg.score(weights="weights.tsv", cugen_dir="data/")  # ≈ plink2 --score
 cg.plot.qq(sumstats); cg.plot.manhattan(sumstats)
 ```
 
+## Choosing a background
+
+The *background* is the polygenic LOCO model that step 4 tests each variant against. Every
+engine in `cg.background` writes the same `LocoPredictions` contract
+(`loco_predictions.npz`: one prediction column per chromosome, a `chromosomes` field and the
+sample IDs), so any of them can feed step 4.
+
+| engine | call | method | use it for |
+|---|---|---|---|
+| UltraLasso | `cg.fit_joint_lasso` (steps 1–3, `cg.background.ultralasso`) | joint LASSO + LOCO OLS refits | biobank scale (n in the hundreds of thousands); needs CUDA |
+| CuGenie | `cg.fit_cugenie` | REGENIE v2.2.4-exact step 1: block ridge, ridge stacking, masked LOCO | small and mid-size cohorts; CPU or GPU |
+| CuGenie-K | `cg.fit_cugenie_k` | whole-genome kernel ridge, exact leave-one-out CV | n up to a few thousand (n × n kernels) |
+| UltraLOCO | `cg.fit_ultraloco` + `cg.ultraloco_gwas` | GLS-LOCO mixed model (GCTA-MLMA-LOCO equivalent), its own whitened test | small cohorts with relatedness or structure |
+
+Scope rule: at small n (a few thousand samples) the lasso background overfits (in-sample LOCO
+R² near 1), the LOCO offset absorbs the signal and the Manhattan plot goes flat; use CuGenie or
+UltraLOCO there, which are the calibrated small-n choices. CuGenie-K with the plain offset test
+deflates a structured null (λ_GC ≈ 0.92 in our tests); `fit_ultraloco(scaling="regenie",
+pairwise_count=False)` uses the same kernel for GLS whitening (the MLMA-whitened CuGenie-K).
+
+Options worth knowing:
+* `fit_cugenie(loco="masked" | "refit" | "both")`: masked is REGENIE-exact; refit refits level 1
+  per chromosome.
+* `fit_cugenie_k(offset="loo" | "insample", lam_grid="wide" | "stable" | array, null_tol=)`:
+  `"wide"` (1e-7..1e3, default) reproduces the validated reference; below λ ≈ 1e-5 the LOO-CV
+  choice is rounding-dominated (a warning says so) and `"stable"` (1e-5..1e3) gives
+  implementation-stable choices.
+* `fit_ultraloco(grm_snps=, pairwise_count=True, scaling="gcta" | "regenie")`,
+  `ultraloco_gwas(reml_bounds=(1e-3, 1e4))`; `ultraloco_gwas(geno, y, covariates, ...)` also
+  runs end to end.
+* `chromosomes=` on every call restricts the analysis; the LOCO columns are exactly those
+  chromosomes (default: 1..max chromosome of the panel, so column c-1 is chromosome c).
+* A phenotype with two values gets a linear-probability background and a warning (no
+  logistic level 1).
+
+Step 4 for these backgrounds is the blocked engine `cg.background.gwas_blocked` (numpy or
+cupy, `.bed` or cugen input, several backgrounds in one pass). It reproduces the linear
+`cg.gwas` statistic (max |ΔZ| ≈ 2e-6 on public Darwin's Ark data) and writes the same columns
+(`CHR POS ID REF ALT BETA SE Z P MAF gidx`) and output layout; `cg.gwas` will dispatch to it
+as `engine="blocked"` in a later release. `cg.summarize(ss)` gives λ_GC, the GWS count and
+1-Mb distance clumps from Z.
+
+## Running on CPU
+
+```python
+import cugen as cg
+
+cg.cuda.is_available()                        # cupy imports, a device exists and a 1-element op runs
+geno = cg.open_genotypes("cohort")            # PLINK prefix (counts .bim A1) or a cugen directory
+loco = cg.fit_cugenie(geno, y, covariates, snps="prune.prune.in", device="cpu")
+ss   = cg.background.gwas_blocked(geno, loco)                 # all variants
+info, loci = cg.summarize(ss)                                  # lambda_GC, GWS, loci
+loco.save("out/loco_predictions.npz"); ss.to_feather("out/height.sumstats.feather")
+```
+
+* **Devices** follow PyTorch naming: `cg.device("auto" | "cpu" | "cuda" | "cuda:N")`, an int
+  is a CUDA index. Every new function takes `device="auto"` (the `CUGEN_DEVICE` environment
+  variable overrides "auto"). `pip install cugen` without the `gpu` extra is enough for the CPU
+  path; cupy is never imported unless a GPU is used.
+* **Samples and phenotypes.** `y` rows follow `geno.sample_ids`; phenotypes must be complete
+  cases. For REGENIE-identical folds keep samples in `.fam` order.
+* **Alleles.** `BedGenotypes(counted="A1")` counts `.bim` column 5 by default (PLINK/REGENIE;
+  note plink2 writes ALT there), `counted="A2"` column 6. `CugenGenotypes` counts the cugen's
+  `ALT`; `cg.bed2cugen` stores column 6 by default and takes the same `counted=` option. In the
+  output `ALT` is always the counted allele, and `ss.attrs["counted_allele"]` and the log name it.
+* **Resources.** Every `fit_*` and `gwas_blocked` accepts `estimate_only=True` and returns,
+  without computing anything, `work_bytes` (what the call allocates), `peak_bytes` (whole
+  process), FLOPs per stage and the dominant stage. Before allocating, each call checks
+  `work_bytes` against free memory (the job's cgroup limit minus non-reclaimable usage, or free
+  VRAM) and raises `cg.CugenResourceError` listing options that would fit (`low_memory=True`, a
+  pruned `snps=`/`grm_snps=` panel, `gram_dtype="float32"`, `pairwise_count=False`, smaller
+  blocks). `low_memory="auto"` (default) switches by itself; `memory_budget="6G"` or
+  `CUGEN_MEMORY_LIMIT=6G` caps it. (`gpu.memory_limit_gb` in the workflow config is the CuPy pool
+  limit, a different thing.)
+* **Measured costs** (dog height, defaults, 4 CPU cores and an 8 GB memory limit; peak RSS from
+  `/usr/bin/time`): Darwin's Ark 2022, n = 1,949, 8.86M variants; Darwin's Ark 2025, n = 3,074,
+  10.1M variants.
+
+  | stage | 2022, CPU | 2025, CPU | 2022, one GPU |
+  |---|---|---|---|
+  | `fit_cugenie` (500k-SNP step-1 panel, 3 phenotypes) | 8.4 min, 1.7 GiB | 8.7 min, 2.0 GiB | 41 s |
+  | `fit_cugenie_k` (pruned panel, 770k / 841k SNPs) | 2.8 min, 2.7 GiB | 7.0 min, 4.8 GiB (`low_memory=True`: 10.3 min, 2.0 GiB) | 4 s |
+  | `gwas_blocked`, all variants, cugen input | 5.4 min, 2.2 GiB (`.bed` input: 8.8 min, 1.9 GiB) | 5.6 min, 2.6 GiB | 2 s |
+  | UltraLOCO, pruned GRM, all variants tested | 16.7 min, 4.4 GiB | 40 min, 3.9 GiB (`low_memory` chosen automatically) | - |
+  | UltraLOCO, all-variant GRM | 39 min (GRM pass 25 min) | not run (`estimate_only`: ~590 TFLOP) | 26 s |
+
+  CPU time goes to decoding the 2-bit genotypes (step 4), to the level-0 eigendecompositions
+  (CuGenie), and to the GRM pass or the whitened test (UltraLOCO; use a pruned `grm_snps` panel
+  on CPU).
+* The UltraLasso steps 1–3 and the pool step 4 (`cg.gwas`) need CUDA.
+
+## Demo data (`cugen.datasets`)
+
+`cugen.datasets` ships code, not data: a generator for a fully synthetic GWAS cohort, evaluators that
+score results against its known truth, and a checksum-verified `fetch()` for published datasets.
+Everything is CPU-only (numpy and the standard library).
+
+### Synthetic "exaggerated height"
+
+```bash
+python -m cugen.datasets.simulate_height --out demo_height --preset n3k  --n-workers 8   # n = 3,000, ~1 GB
+python -m cugen.datasets.simulate_height --out demo_height --preset n20k --n-workers 8   # n = 20,000, ~12 GB, ~7 min
+cd demo_height && python -c "import cugen as cg; cg.ultra_workflow('config_ultralasso.json')"
+python -m cugen.datasets.evaluate results/ultralasso/height/sumstats.tsv.gz .
+```
+
+```python
+from cugen.datasets import simulate_height, workflow_config, evaluate_gwas, background_r2
+meta = simulate_height("demo_height", preset="n3k", n_workers=8)    # keyword arguments override the preset
+cfg = workflow_config("demo_height", "results/std")                   # package defaults
+```
+
+LD comes from a haplotype-mosaic model (founder haplotypes per LD block, Markov switching inside a
+block); `n_pops`/`fst` add Balding-Nichols structure and `strat_shift` a population mean shift;
+`n_chrom` above 22 uses equal-length chromosomes (`chrom_lengths="equal"`). Outputs: per-chromosome
+`.cugen`, PLINK `.bed/.bim/.fam` (A1 = ALT, the counted allele), `pheno.tsv`, `covar.tsv`,
+`truth.tsv`, `annotation.feather`, `ld_blocks.tsv`, a held-out `test/` cohort, a ready
+`config_ultralasso.json` and `meta.json`. The run is deterministic for a seed whatever `n_workers`;
+because numpy does not promise identical random streams across versions, `meta.json` records the
+numpy version and a sha256 per file, and `cugen.datasets.verify("demo_height", "demo_height_n20k")`
+reports any file that differs.
+
+On `n20k` with the package defaults, UltraLasso found 259 loci against REGENIE v2.2.4's 155, with
+genomic control over causal-free LD blocks of 1.003 vs 1.002 and no false loci; 150 of REGENIE's
+155 loci lie within 250 kb of an UltraLasso locus. Read that with three qualifications: the two
+association statistics correlate at r(z) = 0.77 rather than ~1, because the LOCO backgrounds differ
+in strength (in-sample R² 0.51 vs 0.16); at this sample size the default LOCO offset attenuates
+causal effects by 7-8 %; and this is one synthetic architecture, not a benchmark across traits.
+`evaluate_finemapping` scores UltraSuSiE credible sets against the truth. For small cohorts the
+config uses one step-4 worker (`gpu.n_workers_gwas = 1`); scripts that use more need an
+`if __name__ == "__main__":` guard.
+
+### Published datasets
+
+```python
+from cugen import datasets
+datasets.list_datasets()                       # demo_height_n20k, demo_height_n3k, darwins_ark_2022, darwins_ark_2025
+datasets.info("darwins_ark_2022")              # files, sizes, sha256, licence, citation
+path = datasets.fetch("darwins_ark_2022", parts=["genotypes"])
+datasets.verify(path, "darwins_ark_2022")
+```
+
+Downloads resume (HTTP `Range`), are checked against the manifest's size and sha256, and land in
+`dest=`, else `$CUGEN_DATA`, else `~/.cache/cugen/datasets`; point it at a large filesystem.
+Archives are extracted member by member with path checks, and nothing in them is executed.
+
+| name | contents | size | access |
+|---|---|---|---|
+| `demo_height_n20k` / `demo_height_n3k` | the synthetic cohorts above | ~12 GB / ~1 GB | not published yet: `fetch` raises `DatasetNotHostedError` with the regenerate command |
+| `darwins_ark_2022` | Darwin's Ark genotypes and phenotypes (Morrill et al., *Science* 2022), Zenodo mirror 6522639 of Dryad doi:10.5061/dryad.g4f4qrfr0, CC0 | 7.0 GB | open |
+| `darwins_ark_2025` | Darwin's Dogs data (Lord et al., *PNAS* 2025), Dryad doi:10.5061/dryad.83bk3jb4r, CC0 | 19.5 GB | manual: Dryad needs a login; download by hand, then `verify()` |
+
+`fetch` stops at verified raw archives: deriving a phenotype and converting the genotypes are up to
+the user. Note the allele conventions when you convert: `cugen.BedGenotypes` counts the bim A1
+allele (as PLINK and REGENIE do), while `cugen.bed2cugen` counts A2 by default (`counted="A1"` to match).
+
 ## The `.cugen` file format
 
 A single fixed-layout binary supporting both streaming and random
@@ -195,6 +353,17 @@ locus without scanning unrelated variants.
 | `cg.ultralasso.susie`      | Step 5 — UltraSuSiE Tier 1 fine-mapping                   |
 | `cg.ultralasso.map_`       | Step 5 — UltraMAP Tier 2 fine-mapping                     |
 | `cg.ultralasso.run`        | End-to-end one-call orchestrator                          |
+
+### `cg.background.*` — LOCO backgrounds on CPU or GPU
+
+| Call | Stage |
+|---|---|
+| `cg.open_genotypes` / `cg.BedGenotypes` / `cg.CugenGenotypes` | genotype block readers (.bed, cugen) |
+| `cg.fit_cugenie`, `cg.fit_cugenie_k`, `cg.fit_ultraloco` | backgrounds (`LocoPredictions`) |
+| `cg.background.fit_joint_lasso` | UltraLasso (same as `cg.fit_joint_lasso`) |
+| `cg.background.gwas_blocked`, `cg.ultraloco_gwas` | step 4 for any background; UltraLOCO's GLS test |
+| `cg.summarize`, `cg.lambda_gc` | λ_GC, GWS count, distance clumps |
+| `cg.device`, `cg.cuda` | device selection and CUDA queries |
 
 ### Workflow + data layer
 
